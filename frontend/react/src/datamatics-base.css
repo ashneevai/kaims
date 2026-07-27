@@ -30,6 +30,15 @@
   --ok: var(--dm-color-success);
   --warning: var(--dm-color-warning);
   --glow: 0 14px 28px rgba(5, 20, 36, 0.14);
+
+  /* Aliases for the later "v2" component styles in styles.css (investigation-story,
+     intelligence-connection, combined-analysis, timeline/execution cards), which
+     reference --panel/--panel-muted/--border/--text. Those tokens were never
+     defined, so every background/border using them was resolving to transparent. */
+  --panel: var(--card);
+  --panel-muted: var(--bg-soft);
+  --border: var(--line);
+  --text: var(--ink);
 }
 
 body {
@@ -84,13 +93,13 @@ h4,
 }
 
 .button-primary {
-  border: 1px solid #5ea4e5;
+  border: 1px solid var(--dm-color-primary-500);
   background: linear-gradient(180deg, var(--dm-color-primary-600), var(--dm-color-primary-700));
   color: #f7fbff;
 }
 
 .button-primary:hover {
-  background: linear-gradient(180deg, #0068bf, #00539e);
+  background: linear-gradient(180deg, var(--dm-color-primary-500), var(--dm-color-primary-600));
 }
 
 .sidebar-section.active {

@@ -211,6 +211,43 @@ async def test_resolution_agent_clamps_all_model_fallback_confidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolution_agent_uses_external_knowledge_when_local_rca_is_ungrounded() -> None:
+    alert = Alert(
+        source="prometheus",
+        name="QueueBacklogHigh",
+        service="checkout-worker",
+        severity=AlertSeverity.HIGH,
+        description="queue backlog rose rapidly after release",
+    )
+    context = Context(
+        incident_id="11111111-1111-4111-8111-111111111111",
+        alert=alert,
+        metadata={
+            "discovery_report": {
+                "report": {
+                    "external_knowledge_used": True,
+                    "external_knowledge_eligible": True,
+                    "hypotheses": [
+                        {
+                            "cause": "Worker throughput dropped after rollout due to unbounded downstream retry latency.",
+                            "confidence": 0.58,
+                        }
+                    ],
+                    "citations": ["external-knowledge://sre/retry-storm-pattern"],
+                },
+                "evidence": [],
+            }
+        },
+    )
+
+    recommendation = await ResolutionIntelligenceAgent(model_gateway=FallbackGateway()).resolve(context)
+
+    assert recommendation.root_cause.startswith("Worker throughput dropped after rollout")
+    assert "external-knowledge://sre/retry-storm-pattern" in recommendation.metadata["rca_analysis"]["evidence_used"]
+    assert recommendation.metadata["rca_analysis"]["external_knowledge_used"] is True
+
+
+@pytest.mark.asyncio
 async def test_resolution_agent_grounds_mysql_exporter_privilege_rca_in_raw_alert() -> None:
     alert = Alert(
         source="logs",

@@ -235,6 +235,10 @@ class ResolutionIntelligenceAgent(BaseAgent):
         accepted: list[str] = []
         for value in values:
             raw = str(value or "").strip()
+            if raw.lower().startswith("external-knowledge://"):
+                if raw not in accepted:
+                    accepted.append(raw)
+                continue
             match = raw if raw in valid_ids else next(
                 (
                     evidence_id
@@ -581,6 +585,27 @@ class ResolutionIntelligenceAgent(BaseAgent):
 
     async def generate_rca(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
+        discovery_report = (
+            context.metadata.get("discovery_report")
+            if isinstance(context.metadata.get("discovery_report"), dict)
+            else {}
+        )
+        discovery_analysis = (
+            discovery_report.get("report")
+            if isinstance(discovery_report.get("report"), dict)
+            else {}
+        )
+        external_knowledge_used = bool(discovery_analysis.get("external_knowledge_used"))
+        external_hypotheses = (
+            discovery_analysis.get("hypotheses")
+            if isinstance(discovery_analysis.get("hypotheses"), list)
+            else []
+        )
+        external_citations = [
+            str(value).strip()
+            for value in (discovery_analysis.get("citations") if isinstance(discovery_analysis.get("citations"), list) else [])
+            if str(value or "").strip().lower().startswith("external-knowledge://")
+        ]
         prompt = PROMPT_IDENTIFY_ROOT_CAUSE
         payload = {"summary": context.alert.description, **state["gathered_context"]}
         response = await self._generate_with_fallback(
@@ -611,12 +636,39 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "lacks the replication client privilege" in self._norm(state["root_cause"])
             and "error 1227" in self._norm(context.alert.description)
         )
+        external_grounding_used = False
         if explicit_alert_diagnosis:
             source_event_id = str(context.alert.labels.get("source_event_id") or context.alert.id)
             alert_evidence_id = f"alert:{source_event_id}"
             if alert_evidence_id in valid_ids and alert_evidence_id not in cited:
                 cited.insert(0, alert_evidence_id)
             model_confidence = max(model_confidence, 0.95)
+        if not cited and external_knowledge_used:
+            best_external_hypothesis = next(
+                (
+                    str(item.get("cause") or "").strip()
+                    for item in external_hypotheses
+                    if isinstance(item, dict) and str(item.get("cause") or "").strip()
+                ),
+                "",
+            )
+            if best_external_hypothesis:
+                state["root_cause"] = best_external_hypothesis
+            if external_citations:
+                cited.extend(value for value in external_citations if value not in cited)
+            else:
+                cited.append("external-knowledge://discovery")
+            best_external_confidence = 0.0
+            for item in external_hypotheses:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    best_external_confidence = float(item.get("confidence") or 0.0)
+                    break
+                except (TypeError, ValueError):
+                    continue
+            model_confidence = max(model_confidence, min(max(best_external_confidence, 0.5), 0.6))
+            external_grounding_used = True
         if not cited:
             model_confidence = min(model_confidence, 0.49)
         state["rca_analysis"] = {
@@ -631,6 +683,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "accepted": cited,
                 "available_count": len(valid_ids),
             },
+            "external_knowledge_used": external_grounding_used,
         }
         state["rationale"] = (
             f"Model {response['model']} proposed the RCA with {len(cited)} validated evidence citation(s); "

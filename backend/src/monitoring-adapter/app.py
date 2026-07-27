@@ -121,6 +121,7 @@ settings.service_name = "monitoring-adapter"
 logger = get_logger(__name__)
 RECENT_ALERTS: deque[dict[str, Any]] = deque(maxlen=200)
 RECENT_INGESTION_EVENTS: deque[dict[str, Any]] = deque(maxlen=500)
+RECENT_INGESTION_EVENTS_BY_SOURCE: dict[str, deque[dict[str, Any]]] = {}
 # Fallback only for deployments without database-backed workflow state.
 PENDING_WORKFLOWS: dict[str, dict[str, Any]] = {}
 CLOSED_INCIDENTS: deque[dict[str, Any]] = deque(maxlen=500)
@@ -179,6 +180,7 @@ ALERTMANAGER_DEDUP_MAX_ENTRIES = max(
     int(os.getenv("ALERTMANAGER_DEDUP_MAX_ENTRIES", "10000") or 10000),
 )
 _ALERTMANAGER_RECENT_DELIVERIES: dict[str, float] = {}
+_LOG_DISCOVERY_ADMISSIONS: deque[float] = deque()
 
 LANDING_PAD_FILE_WATCHER_ENABLED = str(os.getenv("LANDING_PAD_FILE_WATCHER_ENABLED", "true")).strip().lower() in {
     "1",
@@ -358,6 +360,9 @@ JIRA_MAX_NEW_ISSUES_PER_HOUR = max(
     1, int(os.getenv("JIRA_MAX_NEW_ISSUES_PER_HOUR", "5") or 5)
 )
 JIRA_LOG_MIN_OCCURRENCES = max(1, int(os.getenv("JIRA_LOG_MIN_OCCURRENCES", "3") or 3))
+LOG_DISCOVERY_MAX_PER_MINUTE = max(
+    1, int(os.getenv("LOG_DISCOVERY_MAX_PER_MINUTE", "4") or 4)
+)
 JIRA_PROMETHEUS_MIN_OCCURRENCES = max(
     1, int(os.getenv("JIRA_PROMETHEUS_MIN_OCCURRENCES", "1") or 1)
 )
@@ -523,31 +528,32 @@ def _persist_alert_to_landing_pad(
             "raw": raw_alert,
         }
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        RECENT_INGESTION_EVENTS.appendleft(
-            {
-                "file": file_name,
-                "path": str(out_path),
-                "modified_at": now.isoformat(),
-                "received_at": now.isoformat(),
-                "status": status,
-                "error": error,
-                "source": mapped_payload.get("source"),
-                "name": mapped_payload.get("name"),
-                "service": mapped_payload.get("service"),
-                "environment": mapped_payload.get("environment"),
-                "severity": mapped_payload.get("severity"),
-                "description": mapped_payload.get("description"),
-                "application": mapped_payload.get("application") or labels.get("application"),
-                "project": mapped_payload.get("project") or labels.get("project"),
-                "project_name": mapped_payload.get("project_name") or labels.get("project_name"),
-                "labels": labels,
-                "annotations": mapped_payload.get("annotations") or {},
-                "origin_system": mapped_payload.get("origin_system") or labels.get("origin_system"),
-                "ingestion_channel": mapped_payload.get("ingestion_channel") or labels.get("ingestion_channel"),
-                "alert_status": labels.get("alert_status"),
-                "alertname": labels.get("alertname"),
-            }
-        )
+        recent_event = {
+            "file": file_name,
+            "path": str(out_path),
+            "modified_at": now.isoformat(),
+            "received_at": now.isoformat(),
+            "status": status,
+            "error": error,
+            "source": mapped_payload.get("source"),
+            "name": mapped_payload.get("name"),
+            "service": mapped_payload.get("service"),
+            "environment": mapped_payload.get("environment"),
+            "severity": mapped_payload.get("severity"),
+            "description": mapped_payload.get("description"),
+            "application": mapped_payload.get("application") or labels.get("application"),
+            "project": mapped_payload.get("project") or labels.get("project"),
+            "project_name": mapped_payload.get("project_name") or labels.get("project_name"),
+            "labels": labels,
+            "annotations": mapped_payload.get("annotations") or {},
+            "origin_system": mapped_payload.get("origin_system") or labels.get("origin_system"),
+            "ingestion_channel": mapped_payload.get("ingestion_channel") or labels.get("ingestion_channel"),
+            "alert_status": labels.get("alert_status"),
+            "alertname": labels.get("alertname"),
+        }
+        RECENT_INGESTION_EVENTS.appendleft(recent_event)
+        source_key = str(recent_event.get("source") or recent_event.get("origin_system") or "unknown").strip().lower()
+        RECENT_INGESTION_EVENTS_BY_SOURCE.setdefault(source_key or "unknown", deque(maxlen=50)).appendleft(recent_event)
         return str(out_path)
     except Exception:
         logger.exception("failed to persist alert to landing pad %s", status)
@@ -1490,6 +1496,9 @@ async def _process_log_line(record: dict[str, Any]) -> None:
     mapped_payload = log_line_to_alert_payload(record, default_service=LOG_DEFAULT_SERVICE)
     if mapped_payload is None:
         return  # not a failure line — no alert, no Jira ticket
+    # Live stream persistence and Jira qualification are independent. Every
+    # normalized error remains auditable even when it is not Jira-actionable.
+    _persist_alert_to_landing_pad(mapped_payload, record, status="processed")
     jira_routing_enabled = CENTRALIZED_JIRA_ROUTING_ENABLED or (
         OPENSEARCH_LOG_JIRA_ROUTING_ENABLED and str(record.get("source_path") or "").startswith("opensearch://")
     )
@@ -1500,6 +1509,7 @@ async def _process_log_line(record: dict[str, Any]) -> None:
                 record,
                 source="logs",
                 trigger_enabled=OPENSEARCH_LOG_TRIGGER_TROUBLESHOOTING,
+                persist_evidence=False,
             )
         except Exception:
             logger.exception("failed to route log alert through jira: %s", record.get("source_path"))
@@ -1519,7 +1529,6 @@ async def _process_log_line(record: dict[str, Any]) -> None:
         _persist_alert_to_landing_pad(mapped_payload, record, status="failed", error=str(exc))
         return
     mapped_payload["labels"] = dict(alert.labels)
-    _persist_alert_to_landing_pad(mapped_payload, record, status="processed")
 
 
 async def _log_poll_worker() -> None:
@@ -4877,12 +4886,24 @@ def _jira_issue_description(
     return "\n".join(lines)
 
 
+def _claim_log_discovery_capacity() -> bool:
+    now = perf_counter()
+    cutoff = now - 60.0
+    while _LOG_DISCOVERY_ADMISSIONS and _LOG_DISCOVERY_ADMISSIONS[0] < cutoff:
+        _LOG_DISCOVERY_ADMISSIONS.popleft()
+    if len(_LOG_DISCOVERY_ADMISSIONS) >= LOG_DISCOVERY_MAX_PER_MINUTE:
+        return False
+    _LOG_DISCOVERY_ADMISSIONS.append(now)
+    return True
+
+
 async def _route_and_trigger_investigation(
     mapped_payload: dict[str, Any],
     raw_item: dict[str, Any],
     *,
     source: str,
     trigger_enabled: bool = True,
+    persist_evidence: bool = True,
 ) -> dict[str, Any]:
     """Persist raw evidence, apply a cheap recurrence gate, then run Discovery.
 
@@ -4941,8 +4962,25 @@ async def _route_and_trigger_investigation(
         }
     )
     mapped_payload["labels"] = labels
-    _persist_alert_to_landing_pad(mapped_payload, raw_item, status="processed")
+    if persist_evidence:
+        _persist_alert_to_landing_pad(mapped_payload, raw_item, status="processed")
     should_trigger = result.get("routed") and trigger_enabled and JIRA_TRIGGER_TROUBLESHOOTING
+    if should_trigger and source == "logs" and not _claim_log_discovery_capacity():
+        result.update(
+            {
+                "routed": False,
+                "action": "rate_limited",
+                "reason": f"log Discovery budget limited to {LOG_DISCOVERY_MAX_PER_MINUTE} per minute",
+            }
+        )
+        labels.update(
+            {
+                "pipeline_outcome": "rate_limited",
+                "pipeline_reason": str(result["reason"]),
+            }
+        )
+        mapped_payload["labels"] = labels
+        should_trigger = False
     if not should_trigger:
         logger.info(
             "incident_pipeline stage=pre_discovery outcome=%s source=%s fingerprint=%s reason=%s",
@@ -5133,6 +5171,52 @@ def _jira_priority_to_severity(priority_name: str) -> str:
     return "warning"
 
 
+def _jira_adf_to_text(value: Any) -> str:
+    """Flatten Jira Cloud Atlassian Document Format into readable plain text.
+
+    Jira REST v3 returns rich-text fields as nested ADF objects.  Raw ``str()``
+    output is neither useful evidence nor a safe LLM input, so normalize it at
+    the adapter boundary while preserving paragraph/list separation.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(filter(None, (_jira_adf_to_text(item) for item in value))).strip()
+    if not isinstance(value, dict):
+        return str(value).strip()
+
+    node_type = str(value.get("type") or "")
+    if node_type == "text":
+        return str(value.get("text") or "")
+    if node_type == "hardBreak":
+        return "\n"
+
+    children = value.get("content")
+    if not isinstance(children, list):
+        return ""
+    rendered = [_jira_adf_to_text(child) for child in children]
+    rendered = [text for text in rendered if text]
+
+    if node_type == "listItem":
+        return "\n".join(f"- {line}" for text in rendered for line in text.splitlines() if line.strip())
+    separator = "\n" if node_type in {
+        "doc",
+        "heading",
+        "paragraph",
+        "bulletList",
+        "orderedList",
+        "blockquote",
+        "codeBlock",
+        "table",
+        "tableRow",
+        "tableCell",
+        "tableHeader",
+    } else ""
+    return separator.join(rendered).strip()
+
+
 def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
     issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
     if not isinstance(issue, dict):
@@ -5153,6 +5237,7 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
         (str(label) for label in jira_labels if str(label).startswith("kaiops_incident_")),
         "",
     )
+    description = _jira_adf_to_text(fields.get("description")) or summary
 
     mapped_payload = {
         "source": "jira",
@@ -5160,7 +5245,7 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
         "service": str(project.get("key") or "jira-tickets"),
         "environment": "prod",
         "severity": _jira_priority_to_severity(str(priority.get("name") or "")),
-        "description": str(fields.get("description") or summary),
+        "description": description,
         "labels": {
             "alert_status": "firing",
             "ticket_id": issue_key,
@@ -5176,7 +5261,7 @@ def _jira_payload_to_alert_payload(payload: dict[str, Any]) -> tuple[dict[str, A
         },
         "annotations": {
             "summary": summary,
-            "description": str(fields.get("description") or ""),
+            "description": description,
         },
     }
     return mapped_payload, issue_key
@@ -5491,6 +5576,41 @@ async def delete_onboarding_state(project_name: str, provider_name: str | None =
     }
 
 
+def _source_balanced_recent_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Return a newest-first window without allowing one source to hide all others.
+
+    The ingestion buffer is intentionally shared across sources. During a
+    Prometheus burst, a plain ``rows[:limit]`` made recently polled Jira and
+    email events invisible even though they were successfully ingested.
+    Reserve a small slice for every source present in the buffer, then fill
+    remaining capacity with the newest events across all sources.
+    """
+    if limit <= 0 or not rows:
+        return []
+    if len(rows) <= limit:
+        return rows
+
+    sources: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, row in enumerate(rows):
+        source = str(row.get("source") or row.get("origin_system") or "unknown").strip().lower() or "unknown"
+        sources.setdefault(source, []).append((index, row))
+
+    # At most one eighth of the window is reserved per source. This exposes
+    # minority sources while leaving most capacity for true recency.
+    reserve = max(1, min(25, limit // max(len(sources), 1)))
+    selected: dict[int, dict[str, Any]] = {}
+    for source_rows in sources.values():
+        for index, row in source_rows[:reserve]:
+            selected[index] = row
+
+    for index, row in enumerate(rows):
+        if len(selected) >= limit:
+            break
+        selected.setdefault(index, row)
+
+    return [selected[index] for index in sorted(selected)[:limit]]
+
+
 @app.get("/landing-pad/recent")
 def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> dict[str, Any]:
     """Read landing-pad audit files on FastAPI's bounded worker threadpool.
@@ -5501,7 +5621,18 @@ def get_landing_pad_recent(limit: int = 20, include_archive: bool = False) -> di
     unrelated health, alert, and rule API requests.
     """
     safe_limit = max(1, min(int(limit), 200))
-    live_rows = list(RECENT_INGESTION_EVENTS)[:safe_limit]
+    buffered_rows = list(RECENT_INGESTION_EVENTS)
+    seen_files = {str(row.get("file") or row.get("path") or "") for row in buffered_rows}
+    for source_rows in RECENT_INGESTION_EVENTS_BY_SOURCE.values():
+        for row in source_rows:
+            identity = str(row.get("file") or row.get("path") or "")
+            if identity and identity in seen_files:
+                continue
+            buffered_rows.append(row)
+            if identity:
+                seen_files.add(identity)
+    buffered_rows.sort(key=lambda row: str(row.get("received_at") or row.get("modified_at") or ""), reverse=True)
+    live_rows = _source_balanced_recent_rows(buffered_rows, safe_limit)
     if live_rows:
         return {
             "processed_dir": str(LANDING_PAD_PROCESSED_DIR),

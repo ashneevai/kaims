@@ -272,8 +272,24 @@ function cleanRecommendationText(value, fallback = "-") {
   if (value == null) {
     return fallback;
   }
+  if (typeof value === "object") {
+    // Jira Cloud rich-text (ADF) is source evidence, never an RCA result.
+    if (value?.type === "doc" && Array.isArray(value?.content)) {
+      return fallback;
+    }
+  }
   const text = String(value).trim();
   if (!text) {
+    return fallback;
+  }
+  const normalized = text.toLowerCase();
+  if (
+    normalized === "[object object]"
+    || (
+      (normalized.startsWith("{'type': 'doc'") || normalized.startsWith('{"type":"doc"'))
+      && (normalized.includes("'content'") || normalized.includes('"content"'))
+    )
+  ) {
     return fallback;
   }
   const payload = parseStructuredIntelligence(text);
@@ -554,13 +570,35 @@ function sourceChannelLabel(value) {
   return key || "Unknown";
 }
 
+function summarizeAlertSources(rows) {
+  const summary = { prometheus: 0, telemetry: 0, email: 0, ticket: 0, log: 0 };
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const channels = Array.isArray(row?.source_channels) && row.source_channels.length
+      ? row.source_channels
+      : [normalizeAlertChannel(row)];
+    channels.forEach((channel) => {
+      const key = String(channel || "").trim().toLowerCase();
+      if (summary[key] !== undefined) {
+        summary[key] += 1;
+      }
+    });
+  });
+  return summary;
+}
+
 function monitorScopeLabel(scope) {
   const key = String(scope || "").trim().toLowerCase();
   if (key === REAL_USE_CASE_SCOPE) {
-    return "Real Use Cases";
+    return "All Applications (Real Signals)";
   }
   if (key === TEST_USE_CASE_SCOPE) {
     return "Test Use Cases";
+  }
+  if (key === "telemetry") {
+    return "Telemetry (Application Only)";
+  }
+  if (key === "kaiops") {
+    return "KaiOps (Application Only)";
   }
   return scope || "Real Use Cases";
 }
@@ -3645,13 +3683,17 @@ function groundedIntelligenceDisplay(label, value) {
   }
   const isRca = label === "RCA";
   const isImpact = label === "Impact";
-  const headline = String(
+  const headlineValue = (
     isRca
       ? parsed.root_cause || parsed.cause || parsed.summary
       : isImpact
         ? parsed.impact_summary || parsed.service_impact || parsed.customer_impact || parsed.severity_rationale || parsed.summary
         : parsed.recommended_action || parsed.action || parsed.summary
-  ).trim() || `No ${label.toLowerCase()} was produced.`;
+  );
+  const headline = cleanRecommendationText(
+    headlineValue,
+    `No grounded ${label.toLowerCase()} was produced.`,
+  );
   const detailCandidates = isRca
     ? [
         ["Evidence used", parsed.evidence_used],
@@ -3679,7 +3721,11 @@ function groundedIntelligenceDisplay(label, value) {
     .map(([detailLabel, detailValue]) => ({ label: detailLabel, value: intelligenceListText(detailValue) }))
     .filter((item) => item.value);
   const confidence = Number(parsed.confidence_score);
-  if (Number.isFinite(confidence) && confidence >= 0) {
+  if (
+    Number.isFinite(confidence)
+    && confidence >= 0
+    && !headline.toLowerCase().startsWith("no grounded")
+  ) {
     details.push({ label: "Confidence", value: `${Math.round(confidence * 100)}%` });
   }
   return { headline, details };
@@ -3783,38 +3829,83 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   const safeWorkflow = workflow && typeof workflow === "object" ? workflow : {};
   const context = safeWorkflow.context && typeof safeWorkflow.context === "object" ? safeWorkflow.context : {};
   const metadata = context.metadata && typeof context.metadata === "object" ? context.metadata : {};
-  const discovery = metadata.discovery_report && typeof metadata.discovery_report === "object" ? metadata.discovery_report : {};
-  const report = discovery.report && typeof discovery.report === "object" ? discovery.report : {};
-  const evidence = Array.isArray(discovery.evidence) ? discovery.evidence : [];
   const recommendation = safeWorkflow.recommendation && typeof safeWorkflow.recommendation === "object"
     ? safeWorkflow.recommendation
     : {};
+  const recommendationMetadata = recommendation.metadata && typeof recommendation.metadata === "object"
+    ? recommendation.metadata
+    : {};
+  const metadataCandidates = [
+    metadata,
+    recommendationMetadata,
+  ].filter((row) => row && typeof row === "object");
+  const tracePayloads = (Array.isArray(safeWorkflow.event_trace) ? safeWorkflow.event_trace : [])
+    .map((row) => row?.payload)
+    .filter((row) => row && typeof row === "object");
+  const eventContracts = [
+    ...(Array.isArray(safeWorkflow.events) ? safeWorkflow.events : []),
+    ...tracePayloads,
+  ]
+    .map((row) => row?.event_contract?.payload?.discovery || row?.payload?.discovery || row?.discovery)
+    .filter((row) => row && typeof row === "object");
+  const discovery = metadataCandidates
+    .map((row) => row.discovery_report)
+    .find((row) => row && typeof row === "object")
+    || {};
+  const contractDiscovery = eventContracts[0] || {};
+  const report =
+    (discovery.report && typeof discovery.report === "object" && discovery.report)
+    || (contractDiscovery.report && typeof contractDiscovery.report === "object" && contractDiscovery.report)
+    || contractDiscovery
+    || {};
+  const evidence =
+    (Array.isArray(discovery.evidence) && discovery.evidence)
+    || (Array.isArray(contractDiscovery.evidence) && contractDiscovery.evidence)
+    || [];
   const canonicalAnalysis = canonicalIncidentAnalysis(safeWorkflow);
-  const ragMatches = Array.isArray(metadata.rag_matches) ? metadata.rag_matches : [];
+  const ragMatches = metadataCandidates
+    .map((row) => (Array.isArray(row.rag_matches) ? row.rag_matches : null))
+    .find((row) => Array.isArray(row))
+    || [];
   const sourceCounts = evidence.reduce((result, item) => {
     const source = String(item?.source || "other").toLowerCase();
     result[source] = (result[source] || 0) + 1;
     return result;
   }, {});
+  const dependencyRows = Array.isArray(context.dependency_services)
+    ? context.dependency_services
+    : Array.isArray(context.dependencies)
+      ? context.dependencies
+      : [];
+  const dependencies = dependencyRows
+    .map((item) => (typeof item === "string" ? item : item?.service || item?.name || item?.id || ""))
+    .filter(Boolean);
+  const relatedIncidents = Array.isArray(context.related_incidents)
+    ? context.related_incidents
+    : Array.isArray(context.incidents)
+      ? context.incidents
+      : [];
+  const recentChanges = Array.isArray(context.recent_changes)
+    ? context.recent_changes
+    : Array.isArray(context.changes)
+      ? context.changes
+      : [];
   const contextItems = [
     context.deployment ? { label: "Deployment", value: context.deployment, source: "Jenkins / alert / RAG deployment" } : null,
-    Array.isArray(context.dependency_services) && context.dependency_services.length
-      ? { label: "Dependencies", value: context.dependency_services.join(", "), source: "CMDB + dependency documents" }
+    dependencies.length
+      ? { label: "Dependencies", value: dependencies.join(", "), source: "CMDB + dependency documents" }
       : null,
-    Array.isArray(context.related_incidents) && context.related_incidents.length
-      ? { label: "Related incidents", value: `${context.related_incidents.length} historical incident(s)`, source: "RAG incident search" }
+    relatedIncidents.length
+      ? { label: "Related incidents", value: `${relatedIncidents.length} historical incident(s)`, source: "RAG incident search" }
       : null,
-    Array.isArray(context.recent_changes) && context.recent_changes.length
-      ? { label: "Recent changes", value: `${context.recent_changes.length} change record(s)`, source: "ServiceNow + GitHub + RAG changes" }
+    recentChanges.length
+      ? { label: "Recent changes", value: `${recentChanges.length} change record(s)`, source: "ServiceNow + GitHub + RAG changes" }
       : null,
     context.runbook ? { label: "Runbook", value: compactText(context.runbook, 180), source: "RAG runbook retrieval" } : null,
     ragMatches.length ? { label: "Ranked documents", value: `${ragMatches.length} semantic/metadata match(es)`, source: "Vector and metadata search" } : null,
     evidence.length ? { label: "Discovery evidence", value: `${evidence.length} grounded fact(s)`, source: "Discovery MCP" } : null,
   ].filter(Boolean);
   const hypotheses = Array.isArray(report.hypotheses) ? report.hypotheses : [];
-  const recommendationMetadata = recommendation.metadata && typeof recommendation.metadata === "object"
-    ? recommendation.metadata
-    : {};
   const rcaAnalysis = recommendationMetadata.rca_analysis && typeof recommendationMetadata.rca_analysis === "object"
     ? recommendationMetadata.rca_analysis
     : {};
@@ -3840,12 +3931,15 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
   ].filter(Boolean)));
   const queryTerms = Array.isArray(discovery.query_terms)
     ? discovery.query_terms
-    : Array.isArray(metadata.query_terms)
-      ? metadata.query_terms
-      : [];
-  const recentChanges = Array.isArray(context.recent_changes) ? context.recent_changes : [];
-  const dependencies = Array.isArray(context.dependency_services) ? context.dependency_services : [];
-  const relatedIncidents = Array.isArray(context.related_incidents) ? context.related_incidents : [];
+    : Array.isArray(contractDiscovery.query_terms)
+      ? contractDiscovery.query_terms
+      : Array.isArray(report.query_terms)
+        ? report.query_terms
+        : Array.isArray(metadata.query_terms)
+          ? metadata.query_terms
+          : Array.isArray(recommendationMetadata.query_terms)
+            ? recommendationMetadata.query_terms
+            : [];
   const reasoningConfidence = Number(
     recommendation.confidence
     ?? rcaAnalysis.confidence_score
@@ -3914,10 +4008,16 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
       tone: "red",
     },
   ];
+  const fallbackWithoutGrounding = Boolean(
+    (metadata.fallback_used || recommendationMetadata.fallback_used)
+    && (!Array.isArray(rcaAnalysis.evidence_used) || !rcaAnalysis.evidence_used.length)
+  );
   const outputs = [
     {
       label: "RCA",
-      value: Object.keys(rcaAnalysis).length
+      value: fallbackWithoutGrounding
+        ? null
+        : Object.keys(rcaAnalysis).length
         ? rcaAnalysis
         : recommendation.root_cause || (hypotheses[0] && {
             root_cause: hypotheses[0].cause,
@@ -3929,7 +4029,9 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
     },
     {
       label: "Impact",
-      value: Object.keys(impactAnalysis).length
+      value: fallbackWithoutGrounding
+        ? null
+        : Object.keys(impactAnalysis).length
         ? impactAnalysis
         : recommendation.impact || report.impact || canonicalAnalysis.impact,
     },
@@ -4121,6 +4223,11 @@ function IntelligenceConnectionView({ workflow, documents = [], onDownloadDocume
             <div className="intelligence-output-item" key={`output-${item.label}`}>
               <strong>{item.label}</strong>
               <span>{item.display.headline}</span>
+              {item.label === "RCA" && canonicalAnalysis.externalKnowledgeUsed ? (
+                <span className="workflow-pill workflow-pill-active" style={{ alignSelf: "flex-start" }}>
+                  grounded via external knowledge fallback
+                </span>
+              ) : null}
               {item.display.details.length ? (
                 <dl className="intelligence-output-details">
                   {item.display.details.map((detail) => (
@@ -10149,20 +10256,13 @@ export default function App() {
   );
 
   const visibleAlertSourceSummary = useMemo(() => {
-    const summary = { prometheus: 0, telemetry: 0, email: 0, ticket: 0, log: 0 };
-    visibleAlerts.forEach((row) => {
-      const channels = Array.isArray(row?.source_channels) && row.source_channels.length
-        ? row.source_channels
-        : [normalizeAlertChannel(row)];
-      channels.forEach((channel) => {
-        const key = String(channel || "").trim().toLowerCase();
-        if (summary[key] !== undefined) {
-          summary[key] += 1;
-        }
-      });
-    });
-    return summary;
+    return summarizeAlertSources(visibleAlerts);
   }, [visibleAlerts]);
+
+  const allApplicationAlertSourceSummary = useMemo(
+    () => summarizeAlertSources(mergeAlertStreamRows(alerts.rows, closedIncidents.rows)),
+    [alerts.rows, closedIncidents.rows],
+  );
 
   const selectedAlertRow = useMemo(() => {
     return visibleAlerts.find((row) => String(row?.alert_id || row?.id || row?.incident_id || "") === selectedAlertId) || null;
@@ -13838,6 +13938,19 @@ export default function App() {
                   <span className="source-badge source-ticket">Ticket {visibleAlertSourceSummary.ticket}</span>
                   <span className="source-badge source-log">Logs {visibleAlertSourceSummary.log}</span>
                 </div>
+                {String(applicationToMonitor || "").toLowerCase() !== REAL_USE_CASE_SCOPE ? (
+                  <div className="alert-source-breakdown" aria-label="All application source availability">
+                    <span className="subtitle">Available across all applications:</span>
+                    <span className="source-badge source-prometheus">Prometheus {allApplicationAlertSourceSummary.prometheus}</span>
+                    <span className="source-badge source-telemetry">Telemetry {allApplicationAlertSourceSummary.telemetry}</span>
+                    <span className="source-badge source-email">Email {allApplicationAlertSourceSummary.email}</span>
+                    <span className="source-badge source-ticket">Ticket {allApplicationAlertSourceSummary.ticket}</span>
+                    <span className="source-badge source-log">Logs {allApplicationAlertSourceSummary.log}</span>
+                    <button type="button" className="button-secondary" onClick={() => setApplicationToMonitor(REAL_USE_CASE_SCOPE)}>
+                      View all applications
+                    </button>
+                  </div>
+                ) : null}
                 {canManageSeverityOverride ? (
                   <p className="subtitle">L2/L3/Admin can set future severity overrides by alert name + service + environment.</p>
                 ) : null}

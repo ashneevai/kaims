@@ -61,6 +61,66 @@ api_gateway_app = importlib.util.module_from_spec(_API_GATEWAY_SPEC)
 _API_GATEWAY_SPEC.loader.exec_module(api_gateway_app)
 
 
+def test_jira_adf_description_is_normalized_before_discovery() -> None:
+    payload = {
+        "webhookEvent": "jira:issue_updated",
+        "issue": {
+            "id": "10001",
+            "key": "KAN-1",
+            "fields": {
+                "summary": "kaiops-core1 endpoint unavailable",
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "heading",
+                            "attrs": {"level": 2},
+                            "content": [{"type": "text", "text": "Initial hypothesis"}],
+                        },
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "The endpoint is experiencing connectivity issues.",
+                                }
+                            ],
+                        },
+                        {
+                            "type": "bulletList",
+                            "content": [
+                                {
+                                    "type": "listItem",
+                                    "content": [
+                                        {
+                                            "type": "paragraph",
+                                            "content": [{"type": "text", "text": "Service: kaiops-core1"}],
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                },
+                "project": {"key": "KAN"},
+                "priority": {"name": "Highest"},
+            },
+        },
+    }
+
+    alert, issue_key = monitoring_adapter_app._jira_payload_to_alert_payload(payload)
+
+    assert issue_key == "KAN-1"
+    assert alert["description"] == (
+        "Initial hypothesis\n"
+        "The endpoint is experiencing connectivity issues.\n"
+        "- Service: kaiops-core1"
+    )
+    assert alert["annotations"]["description"] == alert["description"]
+    assert "{'type': 'doc'" not in alert["description"]
+
+
 def test_build_event_envelope_exposes_contract_friendly_fields() -> None:
     envelope = build_event_envelope(
         event_type="incident.workflow.selected",

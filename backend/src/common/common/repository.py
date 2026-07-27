@@ -772,17 +772,49 @@ class IncidentRepository:
 
         alert_payload = alert_record.payload if isinstance(alert_record.payload, dict) else {}
 
-        incident_rows = await self.session.execute(
-            select(IncidentRecord).order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc()).limit(300)
-        )
         incident_record = None
-        for record in incident_rows.scalars().all():
-            payload = record.payload if isinstance(record.payload, dict) else {}
-            linked_alert_ids = payload.get("alert_ids", []) if isinstance(payload.get("alert_ids"), list) else []
-            linked_as_strings = {str(item) for item in linked_alert_ids}
-            if normalized_alert_id in linked_as_strings:
-                incident_record = record
-                break
+        projection_result = await self.session.execute(
+            select(IncidentProjectionRecord.incident_id)
+            .where(IncidentProjectionRecord.alert_id == alert_uuid)
+            .order_by(IncidentProjectionRecord.latest_event_at.desc())
+            .limit(1)
+        )
+        projected_incident_id = projection_result.scalar_one_or_none()
+        if projected_incident_id is not None:
+            incident_result = await self.session.execute(
+                select(IncidentRecord).where(IncidentRecord.id == projected_incident_id)
+            )
+            incident_record = incident_result.scalar_one_or_none()
+
+        if incident_record is None:
+            event_link_result = await self.session.execute(
+                select(IncidentEventRecord.incident_id)
+                .where(IncidentEventRecord.alert_id == alert_uuid)
+                .order_by(IncidentEventRecord.created_at.desc())
+                .limit(1)
+            )
+            event_incident_id = event_link_result.scalar_one_or_none()
+            if event_incident_id is not None:
+                incident_result = await self.session.execute(
+                    select(IncidentRecord).where(IncidentRecord.id == event_incident_id)
+                )
+                incident_record = incident_result.scalar_one_or_none()
+
+        if incident_record is None:
+            # Compatibility path for incidents created before projections were
+            # introduced. Keep the scan bounded; current records use the
+            # indexed projection lookup above.
+            incident_rows = await self.session.execute(
+                select(IncidentRecord)
+                .order_by(IncidentRecord.updated_at.desc(), IncidentRecord.created_at.desc())
+                .limit(100)
+            )
+            for record in incident_rows.scalars().all():
+                payload = record.payload if isinstance(record.payload, dict) else {}
+                linked_alert_ids = payload.get("alert_ids", []) if isinstance(payload.get("alert_ids"), list) else []
+                if normalized_alert_id in {str(item) for item in linked_alert_ids}:
+                    incident_record = record
+                    break
 
         if incident_record is None:
             # Fallback: match by service and severity for latest likely incident.
@@ -979,6 +1011,7 @@ class IncidentRepository:
             select(AgentWorkItemRecord)
             .where(AgentWorkItemRecord.incident_id == UUID(incident_id_str))
             .order_by(AgentWorkItemRecord.sequence.asc(), AgentWorkItemRecord.updated_at.asc())
+            .limit(120)
         )
         work_rows = work_rows_result.scalars().all()
         events = [
@@ -1003,9 +1036,10 @@ class IncidentRepository:
         incident_event_result = await self.session.execute(
             select(IncidentEventRecord)
             .where(IncidentEventRecord.incident_id == UUID(incident_id_str))
-            .order_by(IncidentEventRecord.created_at.asc())
+            .order_by(IncidentEventRecord.created_at.desc())
+            .limit(160)
         )
-        incident_event_rows = incident_event_result.scalars().all()
+        incident_event_rows = list(reversed(incident_event_result.scalars().all()))
         event_trace: list[dict[str, Any]] = []
         for row in incident_event_rows:
             payload = row.payload if isinstance(row.payload, dict) else {}

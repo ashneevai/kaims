@@ -23,13 +23,23 @@ def test_any_critical_failure_is_no_go() -> None:
     assert result["autonomous_production_allowed"] is False
 
 
-def test_noncritical_failure_can_be_conditional_go() -> None:
+def test_two_noncritical_failures_below_threshold_is_no_go() -> None:
     evidence = _all_pass()
     evidence["connector_certification"] = False
     evidence["load_performance_certification"] = False
     result = certify_release(evidence=evidence)
+    assert result["score"] == 84
+    assert result["decision"] == ReleaseDecision.NO_GO.value
+    assert result["autonomous_production_allowed"] is False
+
+
+def test_single_noncritical_failure_can_be_conditional_go() -> None:
+    evidence = _all_pass()
+    evidence["connector_certification"] = False
+    result = certify_release(evidence=evidence)
+    assert result["score"] == 92
     assert result["decision"] == ReleaseDecision.CONDITIONAL_GO.value
-    assert result["score"] == 84 or result["decision"] == ReleaseDecision.NO_GO.value
+    assert result["autonomous_production_allowed"] is False
 
 
 def test_missing_critical_evidence_fails_closed() -> None:

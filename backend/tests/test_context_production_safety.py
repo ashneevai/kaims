@@ -14,4 +14,4 @@ def test_production_context_defaults_exclude_static_demo_connectors() -> None:
 
     assert "discovery-mcp" in connector_names
     assert "local-evidence" in connector_names
-    assert "vectordb" in connector_names
+    assert "vector-db" in connector_names

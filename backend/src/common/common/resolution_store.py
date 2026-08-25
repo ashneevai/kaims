@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.resolution_models import Evidence, Investigation, PlanSnapshot, RemediationPlan
+from common.validation_models import ValidationAssessment
 
 
 def _utc_iso() -> str:
@@ -22,13 +23,7 @@ def _json(payload: dict[str, Any]) -> str:
 
 @dataclass(slots=True)
 class CanonicalResolutionStore:
-    """Durable system-of-record adapter for Wave 2 canonical resolution objects.
-
-    The store deliberately uses one versioned envelope table during migration. This
-    avoids coupling every service to a large schema migration while making canonical
-    objects durable and auditable. A later migration may split high-volume object
-    types into dedicated tables without changing the public repository contract.
-    """
+    """Durable system-of-record adapter for canonical resolution lifecycle objects."""
 
     session: AsyncSession
 
@@ -158,6 +153,18 @@ class CanonicalResolutionStore:
             revision=snapshot.plan_revision,
             content_hash=snapshot.plan_hash,
             payload=snapshot.model_dump(mode="json"),
+        )
+
+    async def save_validation_assessment(self, assessment: ValidationAssessment) -> None:
+        tenant_id = str(assessment.tenant_id or "").strip()
+        if not tenant_id:
+            raise ValueError("TENANT_CONTEXT_MISSING: validation assessment requires tenant scope")
+        await self._put(
+            object_type="validation_assessment",
+            object_id=str(assessment.assessment_id),
+            tenant_id=tenant_id,
+            incident_id=str(assessment.incident_id),
+            payload=assessment.model_dump(mode="json"),
         )
 
     async def load_latest_plan(self, *, tenant_id: str, plan_id: UUID | str) -> RemediationPlan | None:

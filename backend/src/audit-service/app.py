@@ -10,7 +10,9 @@ from common.logging import get_logger
 from common.models import MonitoringAuditEvent, RemediationAction
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.remediation_audit import append_privileged_remediation_audit
+from common.replay_guard import MessageReplayGuard
 from common.repository import IncidentRepository
+from common.resilient_handler import build_resilient_handler
 from common.service import create_app
 from common.topics import (
     APPLICATION_DASHBOARD_CREATED,
@@ -28,6 +30,7 @@ settings = get_settings()
 settings.service_name = "audit-service"
 logger = get_logger(__name__)
 tasks: list[asyncio.Task] = []
+replay_guards: list[MessageReplayGuard] = []
 
 
 def _production() -> bool:
@@ -122,12 +125,24 @@ async def startup(app: FastAPI) -> None:
         APPLICATION_DASHBOARD_CREATED,
     ]:
         consumer = RabbitMQConsumer(settings, topic)
-        tasks.append(asyncio.create_task(consume_rabbitmq_forever(consumer, await handle_factory(topic)), name=f"audit-{topic}"))
+        handler, guard = await build_resilient_handler(
+            settings,
+            namespace=f"audit-service:{topic}",
+            handler=await handle_factory(topic),
+        )
+        replay_guards.append(guard)
+        tasks.append(asyncio.create_task(consume_rabbitmq_forever(consumer, handler), name=f"audit-{topic}"))
 
     remediation_consumer = RabbitMQConsumer(settings, REMEDIATION_EVENTS)
+    remediation_handler, remediation_guard = await build_resilient_handler(
+        settings,
+        namespace=f"audit-service:{REMEDIATION_EVENTS}",
+        handler=handle_remediation,
+    )
+    replay_guards.append(remediation_guard)
     tasks.append(
         asyncio.create_task(
-            consume_rabbitmq_forever(remediation_consumer, handle_remediation),
+            consume_rabbitmq_forever(remediation_consumer, remediation_handler),
             name="audit-remediation-immutable-ledger",
         )
     )
@@ -136,6 +151,11 @@ async def startup(app: FastAPI) -> None:
 async def shutdown(_: FastAPI) -> None:
     for task in tasks:
         task.cancel()
+    for guard in replay_guards:
+        try:
+            await guard.close()
+        except Exception:
+            logger.exception("audit replay guard close failed")
 
 
 app = create_app(title="KaiOps Audit Service", settings=settings, startup=startup, shutdown=shutdown)

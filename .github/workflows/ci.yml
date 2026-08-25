@@ -3,7 +3,9 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
+      - hardening/p0-resolution-safety
 
 jobs:
   test:
@@ -33,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     strategy:
+      fail-fast: false
       matrix:
         service:
           - monitoring-adapter

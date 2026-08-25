@@ -7,6 +7,10 @@ RESOLUTION_EVENTS = "resolution-events"
 APPROVAL_EVENTS = "approval-events"
 REMEDIATION_EVENTS = "remediation-events"
 CLOSURE_EVENTS = "closure-events"
+CLOSURE_LIFECYCLE_EVENTS = "closure-lifecycle-events"
+REASSESSMENT_EVENTS = "incident-reassessment-events"
+ROLLBACK_APPROVAL_EVENTS = "rollback-approval-events"
+HITL_REVIEW_EVENTS = "hitl-review-events"
 APPLICATION_ONBOARD_REQUESTED = "application.onboard.requested"
 APPLICATION_DISCOVERY_COMPLETED = "application.discovery.completed"
 APPLICATION_METRICS_VALIDATED = "application.metrics.validated"
@@ -49,6 +53,10 @@ ALL_TOPICS = [
     APPROVAL_EVENTS,
     REMEDIATION_EVENTS,
     CLOSURE_EVENTS,
+    CLOSURE_LIFECYCLE_EVENTS,
+    REASSESSMENT_EVENTS,
+    ROLLBACK_APPROVAL_EVENTS,
+    HITL_REVIEW_EVENTS,
     APPLICATION_ONBOARD_REQUESTED,
     APPLICATION_DISCOVERY_COMPLETED,
     APPLICATION_METRICS_VALIDATED,

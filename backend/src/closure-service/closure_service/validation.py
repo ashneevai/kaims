@@ -71,12 +71,17 @@ class ClosureValidationAgent(BaseAgent):
         )
 
         validation = {
-            **checks,
-            "validation_status": status,
-            "evidence_count": len(evidence),
-            "independent_validation": True,
-            "required_checks_present": required_present,
+            key: bool(value)
+            for key, value in checks.items()
         }
+        validation.update(
+            {
+                "independent_validation": True,
+                "required_checks_present": required_present,
+                "validation_data_available": has_live_evidence,
+                "validation_succeeded": restored,
+            }
+        )
         action_taken = action.output or action.action_type
         reason = str(collected.get("reason") or "")
 
@@ -107,4 +112,10 @@ class ClosureValidationAgent(BaseAgent):
             health_restored=restored,
             knowledge_base_entry=knowledge_entry,
             lessons_learned=lessons,
+            metadata={
+                "validation_status": status,
+                "validation_evidence_count": len(evidence),
+                "validation_reason": reason,
+                "validation_evidence": evidence,
+            },
         )

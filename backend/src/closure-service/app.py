@@ -221,7 +221,9 @@ async def _persist_closure_event(
                     "action_taken": report.action_taken,
                     "health_restored": report.health_restored,
                     "alerts_cleared": report.alerts_cleared,
-                    "validation_status": report.validation.get("validation_status") if isinstance(report.validation, dict) else None,
+                    "validation_status": (
+                        report.metadata.get("validation_status") if isinstance(report.metadata, dict) else None
+                    ),
                 },
             )
         )
@@ -270,11 +272,12 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
             repo = IncidentRepository(session)
             await repo.save_report(report)
             validation = report.validation if isinstance(report.validation, dict) else {}
+            metadata = report.metadata if isinstance(report.metadata, dict) else {}
             independently_verified = bool(
                 report.health_restored
                 and validation.get("independent_validation") is True
-                and int(validation.get("evidence_count") or 0) > 0
-                and str(validation.get("validation_status") or "").upper() in {"RECOVERED", "VALIDATION_SUCCEEDED"}
+                and int(metadata.get("validation_evidence_count") or 0) > 0
+                and str(metadata.get("validation_status") or "").upper() in {"RECOVERED", "VALIDATION_SUCCEEDED"}
             )
             if independently_verified:
                 await repo.save_knowledge_base(report)

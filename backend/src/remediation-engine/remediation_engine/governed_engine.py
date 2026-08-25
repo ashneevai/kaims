@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from common.config import get_settings
+from common.enterprise_governance import enforce_tenant_scope, validate_secret_governance
 from common.execution_safety import (
     ExecutionSafetyDecision,
     build_execution_safety_assessment,
@@ -19,7 +20,7 @@ from remediation_engine.terraform_staged import TerraformNativeStagedPlugin
 
 
 class GovernedRemediationEngine(SafeRemediationEngine):
-    """Safe remediation engine with rollback/change and execution-safety enforcement."""
+    """Safe remediation engine with enterprise governance and execution-safety enforcement."""
 
     def __init__(
         self,
@@ -40,6 +41,12 @@ class GovernedRemediationEngine(SafeRemediationEngine):
             "terraform_rollback": TerraformNativeStagedPlugin(action_type="terraform_rollback"),
         }
 
+    @property
+    def _production(self) -> bool:
+        return self._settings.environment.lower() not in {
+            "local", "dev", "development", "test", "testing", "simulation"
+        }
+
     def build_action(self, approval: Approval) -> RemediationAction:
         action = super().build_action(approval)
         if action.action_type == "unsupported_capability":
@@ -53,6 +60,36 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         action.output = "remediation blocked by execution safety controller"
         action.parameters["execution_safety_block_reason"] = reason
         return action
+
+    def _apply_enterprise_governance(self, action: RemediationAction) -> RemediationAction | None:
+        expected_tenant = action.parameters.get("authorized_tenant_id")
+        actual_tenant = action.parameters.get("tenant_id")
+        tenant = enforce_tenant_scope(
+            expected_tenant_id=expected_tenant,
+            payload_tenant_id=actual_tenant,
+            production=self._production,
+        )
+        if not tenant.allowed:
+            return self._block_execution(action, tenant.reason)
+
+        connection_profile = action.parameters.get("connection_profile")
+        connection_profile = connection_profile if isinstance(connection_profile, dict) else {}
+        secret_ref = action.parameters.get("secret_ref") or connection_profile.get("secret_ref")
+        secret = validate_secret_governance(
+            secret_ref=secret_ref,
+            payload={"connection_profile": connection_profile},
+            production=self._production,
+        )
+        if not secret.allowed:
+            return self._block_execution(action, secret.reason)
+
+        action.parameters["enterprise_governance"] = {
+            "tenant_id": tenant.tenant_id,
+            "tenant_scope_verified": True,
+            "secret_ref": secret.secret_ref,
+            "secret_material_externalized": True,
+        }
+        return None
 
     async def _execute_with_strategy(self, action: RemediationAction) -> RemediationAction:
         stages = action.parameters.get("execution_stages")
@@ -77,6 +114,10 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         return result.action
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
+        governance_block = self._apply_enterprise_governance(action)
+        if governance_block is not None:
+            return governance_block
+
         assessment = build_execution_safety_assessment(action)
         action.parameters["pre_execution_snapshot"] = immutable_pre_execution_snapshot(action)
         action.parameters["pre_execution_snapshot_hash"] = assessment.snapshot_hash
@@ -121,14 +162,7 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         try:
             action.parameters["execution_coordination"] = {
                 "lock_acquired": True,
-                "distributed": self._settings.environment.lower() not in {
-                    "local",
-                    "dev",
-                    "development",
-                    "test",
-                    "testing",
-                    "simulation",
-                },
+                "distributed": self._production,
                 "reason": coordination.reason,
             }
             action = await self._execute_with_strategy(action)

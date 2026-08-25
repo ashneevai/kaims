@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from common.autonomy_control import AutonomyMode, action_allowed_for_mode
+from common.autonomy_runtime import AutonomyRuntimeStore
 from common.config import get_settings
 from common.enterprise_governance import enforce_tenant_scope, validate_secret_governance
 from common.execution_safety import (
@@ -20,7 +22,7 @@ from remediation_engine.terraform_staged import TerraformNativeStagedPlugin
 
 
 class GovernedRemediationEngine(SafeRemediationEngine):
-    """Safe remediation engine with enterprise governance and execution-safety enforcement."""
+    """Safe remediation engine with enterprise, autonomy, and execution-safety enforcement."""
 
     def __init__(
         self,
@@ -28,11 +30,16 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         execution_coordinator: Any | None = None,
         staged_executor: NativeStagedExecutor | None = None,
         staged_plugins: dict[str, Any] | None = None,
+        autonomy_store: AutonomyRuntimeStore | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._settings = get_settings()
         self.execution_coordinator = execution_coordinator or build_execution_coordinator(self._settings)
+        self.autonomy_store = autonomy_store or AutonomyRuntimeStore(
+            self._settings.redis_url,
+            environment=self._settings.environment,
+        )
         self.staged_executor = staged_executor or NativeStagedExecutor()
         self.staged_plugins = staged_plugins or {
             "restart_pod": KubernetesNativeStagedPlugin(action_type="restart_pod"),
@@ -91,25 +98,37 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         }
         return None
 
+    async def _apply_autonomy_governance(self, action: RemediationAction) -> RemediationAction | None:
+        governance = action.parameters.get("enterprise_governance")
+        governance = governance if isinstance(governance, dict) else {}
+        tenant_id = str(governance.get("tenant_id") or action.parameters.get("tenant_id") or "default")
+        state = await self.autonomy_store.get(tenant_id)
+        mode = str(state.get("mode") or AutonomyMode.HITL_ONLY.value).upper()
+        requires_approval = bool(action.approval_id) or bool(action.parameters.get("requires_approval"))
+        action.parameters["autonomy_governance"] = {
+            "tenant_id": tenant_id,
+            "mode": mode,
+            "score": state.get("score"),
+            "evaluated_at": state.get("evaluated_at"),
+            "reasons": state.get("reasons", []),
+        }
+        if mode == AutonomyMode.KILL_SWITCH.value:
+            return self._block_execution(action, "AUTONOMY_KILL_SWITCH_ACTIVE")
+        if not action_allowed_for_mode(mode=mode, requires_approval=requires_approval, is_read_only=False):
+            return self._block_execution(action, f"AUTONOMY_MODE_REQUIRES_APPROVAL:{mode}")
+        return None
+
     async def _execute_with_strategy(self, action: RemediationAction) -> RemediationAction:
         stages = action.parameters.get("execution_stages")
         stages = [item for item in stages if isinstance(item, dict)] if isinstance(stages, list) else []
         strategy = str(action.parameters.get("execution_strategy") or "SINGLE").strip().upper()
         multi_stage = strategy in {"CANARY", "PROGRESSIVE"} or len(stages) > 1
-
         if not multi_stage:
             return await super().execute(action)
-
         action_type = str(action.action_type or "").strip().lower()
-        plugin = self.staged_plugins.get(action_type)
+        plugin = self.staged_plugins.get(action_type) or self.plugins.get(action_type)
         if plugin is None:
-            plugin = self.plugins.get(action_type)
-        if plugin is None:
-            return self._block_execution(
-                action,
-                f"NATIVE_STAGED_EXECUTOR_UNAVAILABLE: no plugin registered for {action.action_type}",
-            )
-
+            return self._block_execution(action, f"NATIVE_STAGED_EXECUTOR_UNAVAILABLE: no plugin registered for {action.action_type}")
         result = await self.staged_executor.execute(plugin=plugin, action=action)
         return result.action
 
@@ -117,6 +136,9 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         governance_block = self._apply_enterprise_governance(action)
         if governance_block is not None:
             return governance_block
+        autonomy_block = await self._apply_autonomy_governance(action)
+        if autonomy_block is not None:
+            return autonomy_block
 
         assessment = build_execution_safety_assessment(action)
         action.parameters["pre_execution_snapshot"] = immutable_pre_execution_snapshot(action)
@@ -124,24 +146,16 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         action.parameters["execution_idempotency_key"] = assessment.idempotency_key
         action.parameters["execution_lock_key"] = assessment.lock_key
         action.parameters["execution_stages"] = [
-            {
-                "name": stage.name,
-                "percent": stage.percent,
-                "requires_health_gate": stage.requires_health_gate,
-            }
+            {"name": stage.name, "percent": stage.percent, "requires_health_gate": stage.requires_health_gate}
             for stage in assessment.stages
         ]
-        action.parameters.setdefault(
-            "execution_abort_policy",
-            {
-                "abort_on_health_gate_failure": True,
-                "abort_on_new_critical_alert": True,
-                "abort_on_error_rate_regression": True,
-                "abort_on_dependency_regression": True,
-                "require_manual_recovery_after_rollback_failure": True,
-            },
-        )
-
+        action.parameters.setdefault("execution_abort_policy", {
+            "abort_on_health_gate_failure": True,
+            "abort_on_new_critical_alert": True,
+            "abort_on_error_rate_regression": True,
+            "abort_on_dependency_regression": True,
+            "require_manual_recovery_after_rollback_failure": True,
+        })
         if assessment.decision == ExecutionSafetyDecision.BLOCK:
             return self._block_execution(action, assessment.reason)
 
@@ -151,11 +165,7 @@ class GovernedRemediationEngine(SafeRemediationEngine):
             ttl_seconds=int(action.parameters.get("execution_lock_ttl_seconds") or 600),
         )
         if not coordination.acquired:
-            reason = (
-                "IDEMPOTENT_DUPLICATE: execution already completed"
-                if coordination.duplicate
-                else f"EXECUTION_LOCK_UNAVAILABLE: {coordination.reason}"
-            )
+            reason = "IDEMPOTENT_DUPLICATE: execution already completed" if coordination.duplicate else f"EXECUTION_LOCK_UNAVAILABLE: {coordination.reason}"
             return self._block_execution(action, reason)
 
         success = False

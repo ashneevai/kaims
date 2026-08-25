@@ -34,6 +34,20 @@ def _dedupe(values: list[str]) -> list[str]:
     return result
 
 
+def _route_payload(lifecycle_event: dict[str, Any]) -> dict[str, Any]:
+    payload = lifecycle_event.get("payload")
+    return payload if isinstance(payload, dict) else lifecycle_event
+
+
+def _source_event(lifecycle_event: dict[str, Any]) -> dict[str, Any]:
+    route_payload = _route_payload(lifecycle_event)
+    source = route_payload.get("source_payload")
+    if isinstance(source, dict):
+        return source
+    source = lifecycle_event.get("source_event")
+    return source if isinstance(source, dict) else {}
+
+
 @dataclass(frozen=True)
 class ReassessmentConstraints:
     incident_id: str
@@ -72,15 +86,19 @@ def build_reassessment_constraints(
     prior_attempts: int = 0,
     max_attempts: int = DEFAULT_MAX_REASSESSMENT_ATTEMPTS,
 ) -> ReassessmentConstraints:
+    if not isinstance(lifecycle_event, dict):
+        raise ValueError("lifecycle_event must be a mapping")
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
 
-    incident_id = str(lifecycle_event.get("incident_id") or "").strip()
+    route_payload = _route_payload(lifecycle_event)
+    incident_id = str(
+        lifecycle_event.get("incident_id") or route_payload.get("incident_id") or ""
+    ).strip()
     if not incident_id:
         raise ValueError("incident_id is required for reassessment")
 
-    source_event = lifecycle_event.get("source_event")
-    source_event = source_event if isinstance(source_event, dict) else {}
+    source_event = _source_event(lifecycle_event)
     remediation = source_event.get("remediation_action")
     remediation = remediation if isinstance(remediation, dict) else {}
     report = source_event.get("report")
@@ -88,7 +106,6 @@ def build_reassessment_constraints(
 
     action_candidates = [
         remediation.get("action_type"),
-        remediation.get("target"),
         _nested(remediation, "metadata", "capability"),
         _nested(remediation, "parameters", "recommended_capability"),
         _nested(remediation, "parameters", "recommended_action"),
@@ -100,13 +117,13 @@ def build_reassessment_constraints(
     root_cause_candidates = [
         report.get("root_cause"),
         _nested(remediation, "parameters", "root_cause"),
-        _nested(lifecycle_event, "source_event", "event_contract", "metadata", "root_cause"),
+        _nested(source_event, "event_contract", "metadata", "root_cause"),
     ]
     rejected_hypotheses = _dedupe([str(item or "").strip() for item in root_cause_candidates])
 
     previous_action_ids = _dedupe(
         [
-            str(lifecycle_event.get("remediation_action_id") or "").strip(),
+            str(route_payload.get("remediation_action_id") or "").strip(),
             str(remediation.get("id") or "").strip(),
         ]
     )
@@ -128,9 +145,9 @@ def build_reassessment_constraints(
             "previous_incident_history",
             "failed_remediation_effect",
         ),
-        trace_id=str(lifecycle_event.get("trace_id") or ""),
-        correlation_id=str(lifecycle_event.get("correlation_id") or "").strip() or None,
-        flow_id=str(lifecycle_event.get("flow_id") or incident_id),
+        trace_id=str(route_payload.get("trace_id") or ""),
+        correlation_id=str(route_payload.get("correlation_id") or "").strip() or None,
+        flow_id=str(route_payload.get("flow_id") or incident_id),
     )
 
 

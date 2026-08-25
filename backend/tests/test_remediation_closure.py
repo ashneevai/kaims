@@ -40,9 +40,10 @@ async def test_closure_validation_requires_independent_evidence() -> None:
 
     assert report.health_restored is False
     assert report.alerts_cleared is False
-    assert report.validation["validation_status"] == "VALIDATION_DATA_UNAVAILABLE"
-    assert report.validation["evidence_count"] == 0
+    assert report.metadata["validation_status"] == "VALIDATION_DATA_UNAVAILABLE"
+    assert report.metadata["validation_evidence_count"] == 0
     assert report.validation["independent_validation"] is True
+    assert report.validation["validation_data_available"] is False
 
 
 def test_unknown_remediation_is_not_mapped_to_rollback() -> None:

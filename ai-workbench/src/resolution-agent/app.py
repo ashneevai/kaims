@@ -12,11 +12,15 @@ from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Incident, Recommendation
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
+from common.resolution_guard import (
+    build_resolution_guard_hitl_payload,
+    evaluate_reassessment_recommendation,
+)
 from common.resolution_models import PlanSnapshot, RemediationPlan
 from common.resolution_store import CanonicalResolutionStore
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
-from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
+from common.topics import CONTEXT_EVENTS, HITL_REVIEW_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI
 from resolution_agent import ResolutionIntelligenceAgent
 
@@ -239,6 +243,41 @@ async def startup(app: FastAPI) -> None:
                 "stream_count": decision_payload.get("stream_count"),
                 "stream_threshold": decision_payload.get("stream_threshold"),
             }
+
+        guard = evaluate_reassessment_recommendation(
+            recommended_action=recommendation.recommended_action,
+            recommended_capability=recommendation.metadata.get("recommended_capability"),
+            decision_payload=decision_payload,
+        )
+        recommendation.metadata["reassessment_guard"] = {
+            "allowed": guard.allowed,
+            "reason": guard.reason,
+            "requires_hitl": guard.requires_hitl,
+        }
+        if not guard.allowed:
+            if settings.database_enabled:
+                async with app.state.session_factory() as session:
+                    repo = IncidentRepository(session)
+                    await repo.save_recommendation_as_audit(recommendation)
+                    await session.commit()
+            hitl_payload = build_resolution_guard_hitl_payload(
+                incident_id=str(incident.id),
+                recommendation=recommendation,
+                decision_payload=decision_payload,
+                reason=guard.reason,
+            )
+            await app.state.producer.publish(
+                HITL_REVIEW_EVENTS,
+                hitl_payload,
+                key=str(incident.id),
+            )
+            EVENTS_PROCESSED.labels(
+                settings.service_name,
+                HITL_REVIEW_EVENTS,
+                "blocked_reassessment",
+            ).inc()
+            return
+
         if settings.database_enabled:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)

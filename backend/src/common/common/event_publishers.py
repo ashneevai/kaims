@@ -10,7 +10,7 @@ from uuid import uuid4
 from aiokafka import AIOKafkaProducer
 from pydantic import BaseModel
 
-from common.config import Settings
+from common.config import Settings, get_settings
 from common.logging import get_logger
 from common.models import AgentEventContractV1
 from common.rabbitmq import RabbitMQProducer
@@ -65,7 +65,6 @@ def build_event_envelope(
         "idempotency": idempotency if isinstance(idempotency, dict) else {},
         "payload": payload if isinstance(payload, dict) else {},
     }
-    # Keep compatibility with existing nested envelope while exposing a flat contract-friendly view.
     envelope["incident_id"] = incident_id
     envelope["trace_id"] = str(identity_map.get("trace_id") or "")
     envelope["flow_id"] = str(scope.get("flow_id") if isinstance(scope, dict) else "")
@@ -113,6 +112,59 @@ def build_agent_event_contract(
     return event.model_dump(mode="json")
 
 
+def _metadata(value: Any) -> dict[str, Any]:
+    raw = getattr(value, "metadata", None)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _labels(value: Any) -> dict[str, Any]:
+    raw = getattr(value, "labels", None)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _first_scope_value(*values: Any) -> str:
+    for value in values:
+        token = str(value or "").strip()
+        if token:
+            return token
+    return ""
+
+
+def _resolve_required_scope(alert: Any, incident: Any) -> tuple[str, str]:
+    settings = get_settings()
+    alert_metadata = _metadata(alert)
+    incident_metadata = _metadata(incident)
+    alert_labels = _labels(alert)
+
+    tenant_id = _first_scope_value(
+        getattr(alert, "tenant_id", None),
+        getattr(incident, "tenant_id", None),
+        alert_metadata.get("tenant_id"),
+        incident_metadata.get("tenant_id"),
+        alert_labels.get("tenant_id"),
+    )
+    environment = _first_scope_value(
+        getattr(alert, "environment", None),
+        getattr(incident, "environment", None),
+        alert_metadata.get("environment"),
+        incident_metadata.get("environment"),
+        alert_labels.get("environment"),
+    )
+
+    deployment_mode = str(getattr(settings, "environment", "local") or "local").strip().lower()
+    development_mode = deployment_mode in {"local", "dev", "development", "test", "testing", "simulation"}
+    if not tenant_id and development_mode:
+        tenant_id = "local"
+    if not environment and development_mode:
+        environment = deployment_mode or "local"
+
+    if not tenant_id:
+        raise ValueError("tenant scope is required; production events must not default to tenant 'default'")
+    if not environment:
+        raise ValueError("environment scope is required; production events must not default to 'prod'")
+    return tenant_id, environment
+
+
 def build_orchestration_envelope(
     *,
     alert: Any,
@@ -126,7 +178,7 @@ def build_orchestration_envelope(
     trace_id = str(getattr(incident, "trace_id", None) or getattr(alert, "trace_id", "") or "")
     correlation_id = str(getattr(alert, "correlation_id", "") or "")
     service = str(getattr(alert, "service", "") or getattr(incident, "service", "") or "unknown")
-    environment = str(getattr(alert, "environment", "") or getattr(incident, "environment", "") or "prod")
+    tenant_id, environment = _resolve_required_scope(alert, incident)
     severity = str(getattr(alert, "severity", "") or getattr(incident, "severity", "") or "")
     if hasattr(getattr(alert, "severity", None), "value"):
         severity = str(getattr(alert.severity, "value", severity))
@@ -142,7 +194,7 @@ def build_orchestration_envelope(
             "parent_event_id": None,
         },
         scope={
-            "tenant_id": "default",
+            "tenant_id": tenant_id,
             "service": service,
             "environment": environment,
             "region": None,

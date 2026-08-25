@@ -32,6 +32,7 @@ def test_legacy_command_text_is_display_only_and_not_execution_authority() -> No
     gated = CapabilityContractGate().apply(recommendation)
 
     assert gated.metadata["execution_allowed"] is False
+    assert gated.metadata["governance_ready"] is False
     assert gated.metadata["planning_status"] == "CAPABILITY_SELECTION_REQUIRED"
     assert gated.metadata["legacy_execution_preview"]["display_only"] is True
     assert gated.metadata["legacy_execution_preview"]["commands"] == recommendation.commands
@@ -44,9 +45,10 @@ def test_exact_registered_capability_becomes_intent_but_not_execution_authority(
     assert gated.metadata["recommended_capability"] == "kubernetes.restart_workload"
     assert gated.metadata["planning_status"] == "TARGET_RESOLUTION_REQUIRED"
     assert gated.metadata["execution_allowed"] is False
+    assert gated.metadata["governance_ready"] is False
 
 
-def test_valid_structured_plan_binds_hash_and_can_become_execution_eligible() -> None:
+def test_valid_structured_plan_is_governance_ready_but_not_self_authorized() -> None:
     recommendation = _recommendation(action="kubernetes.restart_workload")
     plan = RemediationPlan(
         incident_id=recommendation.incident_id,
@@ -90,7 +92,11 @@ def test_valid_structured_plan_binds_hash_and_can_become_execution_eligible() ->
     gated = CapabilityContractGate().apply(recommendation)
 
     assert gated.metadata["planning_status"] == "STRUCTURED_PLAN_READY"
-    assert gated.metadata["execution_allowed"] is True
+    assert gated.metadata["governance_ready"] is True
+    assert gated.metadata["governance_status"] == "POLICY_EVALUATION_REQUIRED"
+    assert gated.metadata["execution_allowed"] is False
+    assert gated.metadata["quality_gate"]["trusted_for_auto_execution"] is False
+    assert gated.metadata["quality_gate"]["requires_human_review"] is True
     assert gated.metadata["plan_revision"] == 1
     assert len(gated.metadata["plan_hash"]) == 64
 
@@ -112,5 +118,7 @@ def test_unknown_capability_in_structured_plan_is_blocked() -> None:
     gated = CapabilityContractGate().apply(recommendation)
 
     assert gated.metadata["execution_allowed"] is False
+    assert gated.metadata["governance_ready"] is False
     assert gated.metadata["planning_status"] == "INVALID_REMEDIATION_PLAN"
+    assert gated.metadata["governance_status"] == "BLOCKED_INVALID_PLAN"
     assert "UNSUPPORTED_CAPABILITY" in gated.metadata["planning_error"]

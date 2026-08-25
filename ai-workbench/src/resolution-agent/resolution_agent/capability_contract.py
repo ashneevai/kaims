@@ -11,8 +11,8 @@ class CapabilityContractGate:
     """Separate AI recommendation text from the governed execution contract.
 
     Legacy commands remain available only as an operator-facing preview. They never
-    grant execution authority. A recommendation is execution-eligible only when it
-    carries a valid structured `RemediationPlan` whose capability is registered.
+    grant execution authority. A valid structured plan becomes governance-ready;
+    policy and approval remain independent requirements before execution.
     """
 
     def __init__(self, registry: CapabilityRegistry | None = None) -> None:
@@ -47,7 +47,7 @@ class CapabilityContractGate:
         quality_gate["trusted_for_auto_execution"] = False
         quality_gate["requires_human_review"] = True
         quality_gate["execution_contract_reason"] = (
-            "structured remediation plan is required before execution"
+            "structured remediation plan and independent governance are required before execution"
         )
         metadata["quality_gate"] = quality_gate
 
@@ -60,6 +60,8 @@ class CapabilityContractGate:
             "display_only": True,
         }
         metadata["execution_allowed"] = False
+        metadata["governance_ready"] = False
+        metadata["governance_status"] = "PLANNING_REQUIRED"
         metadata["planning_status"] = "CAPABILITY_SELECTION_REQUIRED"
         self._force_quality_gate_review(metadata)
 
@@ -70,13 +72,14 @@ class CapabilityContractGate:
                 self.registry.require(plan.recommended_capability)
             except Exception as exc:
                 metadata["planning_status"] = "INVALID_REMEDIATION_PLAN"
+                metadata["governance_status"] = "BLOCKED_INVALID_PLAN"
                 metadata["planning_error"] = str(exc)[:500]
                 metadata.pop("plan_hash", None)
                 metadata.pop("plan_revision", None)
                 return recommendation.model_copy(update={"metadata": metadata})
 
             snapshot = PlanSnapshot.from_plan(plan)
-            execution_allowed = bool(
+            governance_ready = bool(
                 plan.preflight_assessment
                 and plan.preflight_assessment.passed
                 and plan.risk_assessment is not None
@@ -86,13 +89,19 @@ class CapabilityContractGate:
             metadata["plan_revision"] = snapshot.plan_revision
             metadata["recommended_capability"] = plan.recommended_capability
             metadata["planning_status"] = "STRUCTURED_PLAN_READY"
-            metadata["execution_allowed"] = execution_allowed
+            metadata["governance_ready"] = governance_ready
+            metadata["governance_status"] = (
+                "POLICY_EVALUATION_REQUIRED"
+                if governance_ready
+                else "BLOCKED_PRE_GOVERNANCE"
+            )
             quality_gate = metadata["quality_gate"]
-            quality_gate["requires_human_review"] = not execution_allowed
+            quality_gate["requires_human_review"] = True
+            quality_gate["trusted_for_auto_execution"] = False
             quality_gate["execution_contract_reason"] = (
-                "structured plan passed Wave 3 contract checks"
-                if execution_allowed
-                else "structured plan is not execution eligible"
+                "structured plan is ready for independent policy and approval evaluation"
+                if governance_ready
+                else "structured plan has not passed mandatory pre-governance checks"
             )
             return recommendation.model_copy(update={"metadata": metadata})
 

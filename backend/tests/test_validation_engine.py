@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable
 from typing import Any
 
 import pytest
@@ -102,7 +101,7 @@ def _window(
     }
     observations = []
     evidence_rows = []
-    for index, (check_id, passed) in enumerate(values.items(), start=1):
+    for check_id, passed in values.items():
         if passed is None:
             continue
         evidence_id = f"evidence-{check_id}"

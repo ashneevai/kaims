@@ -12,15 +12,23 @@ from common.models import Approval, RemediationAction, RemediationStatus
 from common.rollback_governance import apply_rollback_governance
 from remediation_engine.execution_coordinator import build_execution_coordinator
 from remediation_engine.safe_engine import SafeRemediationEngine
+from remediation_engine.staged_executor import NativeStagedExecutor
 
 
 class GovernedRemediationEngine(SafeRemediationEngine):
     """Safe remediation engine with rollback/change and execution-safety enforcement."""
 
-    def __init__(self, *args: Any, execution_coordinator: Any | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        execution_coordinator: Any | None = None,
+        staged_executor: NativeStagedExecutor | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._settings = get_settings()
         self.execution_coordinator = execution_coordinator or build_execution_coordinator(self._settings)
+        self.staged_executor = staged_executor or NativeStagedExecutor()
 
     def build_action(self, approval: Approval) -> RemediationAction:
         action = super().build_action(approval)
@@ -35,6 +43,25 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         action.output = "remediation blocked by execution safety controller"
         action.parameters["execution_safety_block_reason"] = reason
         return action
+
+    async def _execute_with_strategy(self, action: RemediationAction) -> RemediationAction:
+        stages = action.parameters.get("execution_stages")
+        stages = [item for item in stages if isinstance(item, dict)] if isinstance(stages, list) else []
+        strategy = str(action.parameters.get("execution_strategy") or "SINGLE").strip().upper()
+        multi_stage = strategy in {"CANARY", "PROGRESSIVE"} or len(stages) > 1
+
+        if not multi_stage:
+            return await super().execute(action)
+
+        plugin = self.plugins.get(str(action.action_type or "").strip().lower())
+        if plugin is None:
+            return self._block_execution(
+                action,
+                f"NATIVE_STAGED_EXECUTOR_UNAVAILABLE: no plugin registered for {action.action_type}",
+            )
+
+        result = await self.staged_executor.execute(plugin=plugin, action=action)
+        return result.action
 
     async def execute(self, action: RemediationAction) -> RemediationAction:
         assessment = build_execution_safety_assessment(action)
@@ -91,7 +118,7 @@ class GovernedRemediationEngine(SafeRemediationEngine):
                 },
                 "reason": coordination.reason,
             }
-            action = await super().execute(action)
+            action = await self._execute_with_strategy(action)
             success = action.status == RemediationStatus.SUCCEEDED
             return action
         finally:

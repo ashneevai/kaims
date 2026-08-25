@@ -57,7 +57,12 @@ class PlannedResolution:
 
 
 class StructuredResolutionPlanner:
-    """Builds the canonical remediation contract without generating execution syntax."""
+    """Build the only governance-ready remediation contract.
+
+    Planning is deterministic after the AI has selected a registered capability. The
+    planner validates parameters, resolves a stable target, runs preflight and risk,
+    and creates the immutable snapshot consumed by approval/execution.
+    """
 
     def __init__(
         self,
@@ -80,6 +85,8 @@ class StructuredResolutionPlanner:
         planning_context: PlanningContext,
     ) -> PlannedResolution:
         capability = self.registry.require(request.recommended_capability)
+        self.registry.validate_parameters(request.recommended_capability, request.parameters)
+
         target = self.target_resolver.resolve(
             resource_id=request.target_resource_id,
             connector_id=request.connector_id,
@@ -90,6 +97,11 @@ class StructuredResolutionPlanner:
             resource_type=target.resource_type,
             environment=target.environment,
         )
+
+        if request.dry_run_required and not capability.dry_run_supported and capability.risk_class.lower() in {"high", "critical"}:
+            raise ValueError(
+                f"DRY_RUN_UNSUPPORTED_FOR_HIGH_RISK_CAPABILITY: {capability.capability_id}"
+            )
 
         plan = RemediationPlan(
             incident_id=request.incident_id,

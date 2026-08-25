@@ -15,6 +15,7 @@ from remediation_engine.jenkins_staged import JenkinsNativeStagedPlugin
 from remediation_engine.kubernetes_staged import KubernetesNativeStagedPlugin
 from remediation_engine.safe_engine import SafeRemediationEngine
 from remediation_engine.staged_executor import NativeStagedExecutor
+from remediation_engine.terraform_staged import TerraformNativeStagedPlugin
 
 
 class GovernedRemediationEngine(SafeRemediationEngine):
@@ -36,6 +37,7 @@ class GovernedRemediationEngine(SafeRemediationEngine):
             "restart_pod": KubernetesNativeStagedPlugin(action_type="restart_pod"),
             "scale_deployment": KubernetesNativeStagedPlugin(action_type="scale_deployment"),
             "rollback_deployment": JenkinsNativeStagedPlugin(action_type="rollback_deployment"),
+            "terraform_rollback": TerraformNativeStagedPlugin(action_type="terraform_rollback"),
         }
 
     def build_action(self, approval: Approval) -> RemediationAction:

@@ -11,6 +11,7 @@ from common.execution_safety import (
 from common.models import Approval, RemediationAction, RemediationStatus
 from common.rollback_governance import apply_rollback_governance
 from remediation_engine.execution_coordinator import build_execution_coordinator
+from remediation_engine.jenkins_staged import JenkinsNativeStagedPlugin
 from remediation_engine.kubernetes_staged import KubernetesNativeStagedPlugin
 from remediation_engine.safe_engine import SafeRemediationEngine
 from remediation_engine.staged_executor import NativeStagedExecutor
@@ -34,6 +35,7 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         self.staged_plugins = staged_plugins or {
             "restart_pod": KubernetesNativeStagedPlugin(action_type="restart_pod"),
             "scale_deployment": KubernetesNativeStagedPlugin(action_type="scale_deployment"),
+            "rollback_deployment": JenkinsNativeStagedPlugin(action_type="rollback_deployment"),
         }
 
     def build_action(self, approval: Approval) -> RemediationAction:

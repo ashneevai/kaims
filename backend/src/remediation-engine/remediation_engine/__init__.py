@@ -3,9 +3,11 @@ from remediation_engine.plugins import (
     ApiExecutionPlugin,
     JenkinsRollbackPlugin,
     KubernetesRestartPlugin,
-    RemediationEngine,
     TerraformRollbackPlugin,
 )
+from remediation_engine.safe_engine import SafeRemediationEngine
+
+RemediationEngine = SafeRemediationEngine
 
 __all__ = [
     "AnsibleRemediationPlugin",
@@ -13,5 +15,6 @@ __all__ = [
     "JenkinsRollbackPlugin",
     "KubernetesRestartPlugin",
     "RemediationEngine",
+    "SafeRemediationEngine",
     "TerraformRollbackPlugin",
 ]

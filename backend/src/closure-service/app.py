@@ -60,8 +60,8 @@ def _build_closure_event_payload(
             "root_cause": report.root_cause,
             "impact": report.impact,
         },
-        confidence=1.0 if report.health_restored else 0.7,
-        reasoning="closure validation derived from remediation outcome and health checks",
+        confidence=1.0 if report.health_restored else 0.0,
+        reasoning="closure validation derived from independent post-action evidence",
         citations=[f"report://{report.id}"],
         evidence_ids=[f"action:{action.id}", f"incident:{incident_id}"],
     )
@@ -80,6 +80,41 @@ def _resolve_closure_service_name(action: RemediationAction, incident_payload: d
     return str(action.target or "unknown").strip() or "unknown"
 
 
+def _resolve_required_scope(
+    action: RemediationAction,
+    incident_payload: dict[str, Any],
+    recommendation: dict[str, Any],
+) -> tuple[str, str]:
+    action_metadata = action.metadata if isinstance(action.metadata, dict) else {}
+    tenant_id = str(
+        incident_payload.get("tenant_id")
+        or action.parameters.get("tenant_id")
+        or action_metadata.get("tenant_id")
+        or recommendation.get("tenant_id")
+        or ""
+    ).strip()
+    environment = str(
+        incident_payload.get("environment")
+        or action.parameters.get("environment")
+        or action_metadata.get("environment")
+        or recommendation.get("environment")
+        or ""
+    ).strip()
+
+    deployment_mode = str(getattr(settings, "environment", "local") or "local").strip().lower()
+    development_mode = deployment_mode in {"local", "dev", "development", "test", "testing", "simulation"}
+    if not tenant_id and development_mode:
+        tenant_id = "local"
+    if not environment and development_mode:
+        environment = deployment_mode or "local"
+
+    if not tenant_id:
+        raise ValueError("tenant scope is required for closure; refusing tenant 'default' fallback")
+    if not environment:
+        raise ValueError("environment scope is required for closure; refusing 'prod' fallback")
+    return tenant_id, environment
+
+
 def _build_final_incident_payload(
     *,
     action: RemediationAction,
@@ -87,6 +122,7 @@ def _build_final_incident_payload(
     incident_payload: dict[str, Any] | None,
     recommendation: dict[str, Any] | None,
     source_contract: dict[str, Any] | None,
+    environment: str,
 ) -> dict[str, Any]:
     incident_payload_map = incident_payload if isinstance(incident_payload, dict) else {}
     recommendation_map = recommendation if isinstance(recommendation, dict) else {}
@@ -95,7 +131,7 @@ def _build_final_incident_payload(
     final_payload = {
         "id": str(action.incident_id),
         "service": service_name,
-        "environment": str(incident_payload_map.get("environment") or action.parameters.get("environment") or "prod"),
+        "environment": environment,
         "severity": str(incident_payload_map.get("severity") or recommendation_map.get("severity") or "warning").lower(),
         "status": IncidentStatus.CLOSED.value if report.health_restored else IncidentStatus.FAILED.value,
         "title": str(incident_payload_map.get("title") or f"Incident {action.incident_id}"),
@@ -126,17 +162,19 @@ async def _persist_closure_event(
     source_contract = source_payload.get("event_contract", {}) if isinstance(source_payload.get("event_contract"), dict) else {}
     source_recommendation = source_payload.get("source_payload", {}).get("recommendation") if isinstance(source_payload.get("source_payload"), dict) else {}
     recommendation = source_recommendation if isinstance(source_recommendation, dict) else {}
-    status = "closed" if bool(report.health_restored) else "failed"
+    status = "closed" if bool(report.health_restored) else "validation_failed"
 
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
         incident_payload = await repo.get_incident(str(action.incident_id)) or {}
+        tenant_id, environment = _resolve_required_scope(action, incident_payload, recommendation)
         final_incident_payload = _build_final_incident_payload(
             action=action,
             report=report,
             incident_payload=incident_payload,
             recommendation=recommendation,
             source_contract=source_contract,
+            environment=environment,
         )
         service_name = str(final_incident_payload.get("service") or "unknown")
         await repo.save_incident(Incident.model_validate(final_incident_payload))
@@ -152,9 +190,9 @@ async def _persist_closure_event(
                     "parent_event_id": None,
                 },
                 scope={
-                    "tenant_id": "default",
+                    "tenant_id": tenant_id,
                     "service": service_name,
-                    "environment": "prod",
+                    "environment": environment,
                     "region": None,
                     "team": None,
                 },
@@ -168,7 +206,7 @@ async def _persist_closure_event(
                     "execution_mode": "unknown",
                     "requires_approval": None,
                     "policy_version": None,
-                    "policy_reason": "closure validation completed",
+                    "policy_reason": "independent closure validation completed",
                 },
                 transport={
                     "provider": "unknown",
@@ -183,6 +221,7 @@ async def _persist_closure_event(
                     "action_taken": report.action_taken,
                     "health_restored": report.health_restored,
                     "alerts_cleared": report.alerts_cleared,
+                    "validation_status": report.validation.get("validation_status") if isinstance(report.validation, dict) else None,
                 },
             )
         )
@@ -230,7 +269,15 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)
             await repo.save_report(report)
-            await repo.save_knowledge_base(report)
+            validation = report.validation if isinstance(report.validation, dict) else {}
+            independently_verified = bool(
+                report.health_restored
+                and validation.get("independent_validation") is True
+                and int(validation.get("evidence_count") or 0) > 0
+                and str(validation.get("validation_status") or "").upper() in {"RECOVERED", "VALIDATION_SUCCEEDED"}
+            )
+            if independently_verified:
+                await repo.save_knowledge_base(report)
             await session.commit()
     return report
 

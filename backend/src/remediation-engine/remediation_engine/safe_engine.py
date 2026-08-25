@@ -58,6 +58,15 @@ class SafeRemediationEngine(LegacyRemediationEngine):
         action.parameters.pop("capability_id", None)
         return action
 
+    def _new_blocked_action(self, approval: Approval, *, target: str, reason: str) -> RemediationAction:
+        action = RemediationAction(
+            incident_id=approval.incident_id,
+            approval_id=approval.id,
+            action_type="unsupported_capability",
+            target=target,
+        )
+        return self._block_unsupported(action, reason)
+
     def _bind_registered_capability(self, action: RemediationAction) -> RemediationAction:
         capability_id = LEGACY_ACTION_CAPABILITIES.get(str(action.action_type or "").strip().lower())
         if not capability_id:
@@ -80,69 +89,90 @@ class SafeRemediationEngine(LegacyRemediationEngine):
         try:
             plan = RemediationPlan.model_validate(plan_payload)
         except Exception as exc:
-            action = RemediationAction(
-                incident_id=approval.incident_id,
-                approval_id=approval.id,
-                action_type="unsupported_capability",
+            return self._new_blocked_action(
+                approval,
                 target=str(approval.incident_id),
+                reason=f"INVALID_REMEDIATION_PLAN: {exc}",
             )
-            return self._block_unsupported(action, f"INVALID_REMEDIATION_PLAN: {exc}")
 
         if plan.incident_id != approval.incident_id:
-            action = RemediationAction(
-                incident_id=approval.incident_id,
-                approval_id=approval.id,
-                action_type="unsupported_capability",
+            return self._new_blocked_action(
+                approval,
                 target=plan.target_resource_id,
+                reason="PLAN_INCIDENT_MISMATCH",
             )
-            return self._block_unsupported(action, "PLAN_INCIDENT_MISMATCH")
 
         definition = self.capability_registry.get(plan.recommended_capability)
         if definition is None:
-            action = RemediationAction(
-                incident_id=approval.incident_id,
-                approval_id=approval.id,
-                action_type="unsupported_capability",
+            return self._new_blocked_action(
+                approval,
                 target=plan.target_resource_id,
-            )
-            return self._block_unsupported(
-                action,
-                f"UNSUPPORTED_CAPABILITY: {plan.recommended_capability}",
+                reason=f"UNSUPPORTED_CAPABILITY: {plan.recommended_capability}",
             )
 
         legacy_action_type = CAPABILITY_LEGACY_ACTIONS.get(definition.capability_id)
         if not legacy_action_type:
-            action = RemediationAction(
-                incident_id=approval.incident_id,
-                approval_id=approval.id,
-                action_type="unsupported_capability",
+            return self._new_blocked_action(
+                approval,
                 target=plan.target_resource_id,
-            )
-            return self._block_unsupported(
-                action,
-                f"Capability '{definition.capability_id}' has no certified executor bridge yet.",
+                reason=f"Capability '{definition.capability_id}' has no certified executor bridge yet.",
             )
 
         snapshot = PlanSnapshot.from_plan(plan)
         metadata = approval.metadata if isinstance(approval.metadata, dict) else {}
         approved_hash = str(metadata.get("plan_hash") or "").strip()
         approved_revision = metadata.get("plan_revision")
-        if approved_hash and approved_hash != snapshot.plan_hash:
-            action = RemediationAction(
-                incident_id=approval.incident_id,
-                approval_id=approval.id,
-                action_type="unsupported_capability",
+        if not approved_hash or approved_revision is None:
+            return self._new_blocked_action(
+                approval,
                 target=plan.target_resource_id,
+                reason="PLAN_APPROVAL_BINDING_MISSING: plan_hash and plan_revision are required",
             )
-            return self._block_unsupported(action, "STALE_OR_MODIFIED_PLAN: plan hash mismatch")
-        if approved_revision is not None and int(approved_revision) != plan.revision:
-            action = RemediationAction(
-                incident_id=approval.incident_id,
-                approval_id=approval.id,
-                action_type="unsupported_capability",
+        if approved_hash != snapshot.plan_hash:
+            return self._new_blocked_action(
+                approval,
                 target=plan.target_resource_id,
+                reason="STALE_OR_MODIFIED_PLAN: plan hash mismatch",
             )
-            return self._block_unsupported(action, "STALE_OR_MODIFIED_PLAN: plan revision mismatch")
+        try:
+            approved_revision_int = int(approved_revision)
+        except (TypeError, ValueError):
+            return self._new_blocked_action(
+                approval,
+                target=plan.target_resource_id,
+                reason="PLAN_APPROVAL_BINDING_INVALID: plan_revision must be an integer",
+            )
+        if approved_revision_int != plan.revision:
+            return self._new_blocked_action(
+                approval,
+                target=plan.target_resource_id,
+                reason="STALE_OR_MODIFIED_PLAN: plan revision mismatch",
+            )
+
+        if plan.preflight_assessment is None:
+            return self._new_blocked_action(
+                approval,
+                target=plan.target_resource_id,
+                reason="PREFLIGHT_REQUIRED: structured plans cannot execute before preflight",
+            )
+        if not plan.preflight_assessment.passed:
+            return self._new_blocked_action(
+                approval,
+                target=plan.target_resource_id,
+                reason="PREFLIGHT_FAILED: structured plan is not execution-ready",
+            )
+        if plan.risk_assessment is None:
+            return self._new_blocked_action(
+                approval,
+                target=plan.target_resource_id,
+                reason="RISK_ASSESSMENT_REQUIRED: structured plans require deterministic action risk",
+            )
+        if definition.validation_required and not plan.validation_plan.checks:
+            return self._new_blocked_action(
+                approval,
+                target=plan.target_resource_id,
+                reason="VALIDATION_PLAN_INCOMPLETE: at least one validation check is required",
+            )
 
         parameters = {
             **plan.parameters,
@@ -163,10 +193,8 @@ class SafeRemediationEngine(LegacyRemediationEngine):
             "execution_strategy": plan.execution_strategy.value,
             "validation_plan": plan.validation_plan.model_dump(mode="json"),
             "rollback_plan": plan.rollback_plan.model_dump(mode="json") if plan.rollback_plan else None,
-            "risk_assessment": plan.risk_assessment.model_dump(mode="json") if plan.risk_assessment else None,
-            "preflight_assessment": (
-                plan.preflight_assessment.model_dump(mode="json") if plan.preflight_assessment else None
-            ),
+            "risk_assessment": plan.risk_assessment.model_dump(mode="json"),
+            "preflight_assessment": plan.preflight_assessment.model_dump(mode="json"),
             "evidence_ids": plan.evidence_ids,
             "root_cause": plan.root_cause,
             "root_cause_confidence": plan.rca_confidence,

@@ -88,127 +88,76 @@ class CapabilityRegistry:
             )
         return definition
 
+    def validate_parameters(self, capability_id: str, parameters: dict[str, Any]) -> None:
+        """Small deterministic schema gate; connectors remain responsible for full validation."""
+        definition = self.require(capability_id)
+        schema = definition.input_schema if isinstance(definition.input_schema, dict) else {}
+        for name, rule in schema.items():
+            if not isinstance(rule, dict):
+                continue
+            required = bool(rule.get("required"))
+            if required and name not in parameters:
+                raise ValueError(f"CAPABILITY_PARAMETER_REQUIRED: {name}")
+            if name not in parameters:
+                continue
+            value = parameters[name]
+            expected = rule.get("type")
+            if expected == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
+                raise ValueError(f"CAPABILITY_PARAMETER_INVALID: {name} must be integer")
+            if expected == "string" and not isinstance(value, str):
+                raise ValueError(f"CAPABILITY_PARAMETER_INVALID: {name} must be string")
+            if expected == "boolean" and not isinstance(value, bool):
+                raise ValueError(f"CAPABILITY_PARAMETER_INVALID: {name} must be boolean")
+            if isinstance(value, (int, float)):
+                if "minimum" in rule and value < rule["minimum"]:
+                    raise ValueError(f"CAPABILITY_PARAMETER_INVALID: {name} below minimum")
+                if "maximum" in rule and value > rule["maximum"]:
+                    raise ValueError(f"CAPABILITY_PARAMETER_INVALID: {name} above maximum")
+
+    @staticmethod
+    def _definition(
+        capability_id: str,
+        provider: str,
+        risk_class: str,
+        resource_types: tuple[str, ...],
+        description: str,
+        permission: str,
+        checks: tuple[str, ...],
+        **kwargs: Any,
+    ) -> CapabilityDefinition:
+        return CapabilityDefinition(
+            capability_id=capability_id,
+            version="1",
+            provider=provider,
+            risk_class=risk_class,
+            supported_resource_types=resource_types,
+            description=description,
+            required_permissions=(permission,),
+            validation_template={"checks": list(checks)},
+            **kwargs,
+        )
+
     def _register_defaults(self) -> None:
+        d = self._definition
         defaults = (
-            CapabilityDefinition(
-                capability_id="kubernetes.restart_workload",
-                version="1",
-                provider="kubernetes",
-                risk_class="medium",
-                description="Restart a Kubernetes workload through a deterministic connector operation.",
-                supported_resource_types=("workload", "deployment", "statefulset"),
-                required_permissions=("kubernetes.workloads.restart",),
-                dry_run_supported=True,
-                validation_template={"checks": ["workload_ready", "original_alert_cleared"]},
-                reversible=False,
-                maximum_blast_radius=1,
-            ),
-            CapabilityDefinition(
-                capability_id="kubernetes.rollback_deployment",
-                version="1",
-                provider="kubernetes",
-                risk_class="high",
-                description="Rollback a Kubernetes deployment to a verified prior revision.",
-                supported_resource_types=("deployment",),
-                required_permissions=("kubernetes.deployments.rollback",),
-                dry_run_supported=True,
-                validation_template={"checks": ["deployment_ready", "service_health", "original_alert_cleared"]},
-                rollback_capability="kubernetes.rollback_deployment",
-                reversible=True,
-                maximum_blast_radius=1,
-            ),
-            CapabilityDefinition(
-                capability_id="kubernetes.scale_workload",
-                version="1",
-                provider="kubernetes",
-                risk_class="medium",
-                description="Adjust workload replicas within policy and blast-radius limits.",
-                supported_resource_types=("workload", "deployment", "statefulset"),
-                required_permissions=("kubernetes.workloads.scale",),
-                input_schema={"replicas": {"type": "integer", "minimum": 0}},
-                dry_run_supported=True,
-                validation_template={"checks": ["desired_replicas_ready", "service_health"]},
-                reversible=True,
-                maximum_blast_radius=1,
-            ),
-            CapabilityDefinition(
-                capability_id="linux.restart_service",
-                version="1",
-                provider="ansible",
-                risk_class="medium",
-                description="Restart an operating-system service through a governed automation connector.",
-                supported_resource_types=("host", "vm", "service"),
-                required_permissions=("linux.services.restart",),
-                validation_template={"checks": ["service_active", "original_alert_cleared"]},
-                maximum_blast_radius=1,
-            ),
-            CapabilityDefinition(
-                capability_id="application.invoke_recovery_endpoint",
-                version="1",
-                provider="api",
-                risk_class="medium",
-                description="Invoke a pre-registered application recovery endpoint.",
-                supported_resource_types=("application", "service", "endpoint"),
-                required_permissions=("application.recovery.invoke",),
-                validation_template={"checks": ["health_endpoint", "original_alert_cleared"]},
-                maximum_blast_radius=1,
-            ),
-            CapabilityDefinition(
-                capability_id="database.collect_diagnostics",
-                version="1",
-                provider="database",
-                risk_class="low",
-                description="Collect read-only database diagnostics.",
-                supported_resource_types=("database", "database_instance"),
-                required_permissions=("database.diagnostics.read",),
-                dry_run_supported=False,
-                validation_required=False,
-                required_approval=False,
-                trust_level=CapabilityTrust.TRUSTED,
-                retry_strategy="bounded-read-retry",
-            ),
-            CapabilityDefinition(
-                capability_id="database.failover",
-                version="1",
-                provider="database",
-                risk_class="critical",
-                description="Fail over a database using provider-specific deterministic controls.",
-                supported_resource_types=("database", "database_instance"),
-                required_permissions=("database.failover",),
-                validation_template={"checks": ["primary_reachable", "replication_healthy", "application_connectivity"]},
-                reversible=False,
-                maximum_blast_radius=1,
-                trust_level=CapabilityTrust.HITL_ONLY,
-                required_approval=True,
-            ),
-            CapabilityDefinition(
-                capability_id="jenkins.rollback_deployment",
-                version="1",
-                provider="jenkins",
-                risk_class="high",
-                description="Trigger a pre-registered Jenkins deployment rollback job.",
-                supported_resource_types=("application", "service", "deployment"),
-                required_permissions=("jenkins.deployment.rollback",),
-                dry_run_supported=True,
-                validation_template={"checks": ["deployment_completed", "service_health"]},
-                reversible=True,
-                maximum_blast_radius=1,
-            ),
-            CapabilityDefinition(
-                capability_id="terraform.rollback",
-                version="1",
-                provider="terraform",
-                risk_class="critical",
-                description="Apply a governed infrastructure rollback plan from an approved state transition.",
-                supported_resource_types=("infrastructure", "cloud_resource"),
-                required_permissions=("terraform.rollback",),
-                dry_run_supported=True,
-                validation_template={"checks": ["plan_matches_expected_state", "resource_health"]},
-                reversible=True,
-                maximum_blast_radius=1,
-                trust_level=CapabilityTrust.HITL_ONLY,
-                required_approval=True,
-            ),
+            d("kubernetes.restart_workload", "kubernetes", "medium", ("workload", "deployment", "statefulset"), "Restart a Kubernetes workload through a deterministic connector operation.", "kubernetes.workloads.restart", ("workload_ready", "original_alert_cleared"), dry_run_supported=True),
+            d("kubernetes.rollback_deployment", "kubernetes", "high", ("deployment",), "Rollback a Kubernetes deployment to a verified prior revision.", "kubernetes.deployments.rollback", ("deployment_ready", "service_health", "original_alert_cleared"), input_schema={"revision": {"type": "string", "required": True}}, dry_run_supported=True, rollback_capability="kubernetes.rollback_deployment", reversible=True),
+            d("kubernetes.scale_workload", "kubernetes", "medium", ("workload", "deployment", "statefulset"), "Adjust workload replicas within policy and blast-radius limits.", "kubernetes.workloads.scale", ("desired_replicas_ready", "service_health"), input_schema={"replicas": {"type": "integer", "minimum": 0, "required": True}}, dry_run_supported=True, reversible=True),
+            d("linux.restart_service", "ansible", "medium", ("host", "vm", "service"), "Restart an operating-system service through governed automation.", "linux.services.restart", ("service_active", "original_alert_cleared"), input_schema={"service_name": {"type": "string", "required": True}}),
+            d("windows.restart_service", "powershell", "medium", ("host", "vm", "service"), "Restart a Windows service through a governed connector.", "windows.services.restart", ("service_running", "original_alert_cleared"), input_schema={"service_name": {"type": "string", "required": True}}),
+            d("application.invoke_recovery_endpoint", "api", "medium", ("application", "service", "endpoint"), "Invoke a pre-registered application recovery endpoint.", "application.recovery.invoke", ("health_endpoint", "original_alert_cleared")),
+            d("database.collect_diagnostics", "database", "low", ("database", "database_instance"), "Collect read-only database diagnostics.", "database.diagnostics.read", (), validation_required=False, required_approval=False, trust_level=CapabilityTrust.TRUSTED, retry_strategy="bounded-read-retry"),
+            d("database.kill_session", "database", "high", ("database", "database_instance"), "Terminate a verified database session after policy approval.", "database.sessions.kill", ("session_absent", "database_health"), input_schema={"session_id": {"type": "string", "required": True}}, reversible=False),
+            d("database.failover", "database", "critical", ("database", "database_instance"), "Fail over a database using provider-specific deterministic controls.", "database.failover", ("primary_reachable", "replication_healthy", "application_connectivity"), reversible=False, trust_level=CapabilityTrust.HITL_ONLY, required_approval=True),
+            d("kafka.restart_consumer", "kafka", "medium", ("consumer", "consumer_group", "application", "service"), "Restart a registered Kafka consumer workload.", "kafka.consumers.restart", ("consumer_running", "lag_recovering"), dry_run_supported=True),
+            d("kafka.rebalance", "kafka", "high", ("consumer_group", "topic"), "Trigger a governed Kafka consumer rebalance.", "kafka.consumer_groups.rebalance", ("assignments_stable", "lag_recovering"), dry_run_supported=True),
+            d("airflow.retry_task", "airflow", "medium", ("task", "task_instance", "pipeline", "dag"), "Retry a failed Airflow task instance.", "airflow.tasks.retry", ("task_succeeded", "downstream_healthy"), input_schema={"dag_id": {"type": "string", "required": True}, "task_id": {"type": "string", "required": True}}),
+            d("airflow.restart_dag", "airflow", "high", ("pipeline", "dag"), "Restart a governed Airflow DAG run.", "airflow.dags.restart", ("dag_running", "critical_tasks_healthy"), input_schema={"dag_id": {"type": "string", "required": True}}),
+            d("cloud.restart_vm", "cloud", "high", ("vm",), "Restart a verified cloud virtual machine.", "cloud.vm.restart", ("vm_running", "service_health", "original_alert_cleared"), dry_run_supported=True),
+            d("cloud.scale_instance_group", "cloud", "high", ("instance_group", "autoscaling_group"), "Adjust a registered cloud instance group within policy limits.", "cloud.instance_groups.scale", ("desired_capacity_healthy", "service_health"), input_schema={"capacity": {"type": "integer", "minimum": 0, "required": True}}, dry_run_supported=True, reversible=True),
+            d("cache.invalidate_keyspace", "cache", "high", ("cache", "redis", "keyspace"), "Invalidate an explicitly scoped registered cache keyspace; never performs unrestricted FLUSHDB.", "cache.keyspace.invalidate", ("application_health",), input_schema={"keyspace": {"type": "string", "required": True}}, reversible=False),
+            d("jenkins.rollback_deployment", "jenkins", "high", ("application", "service", "deployment"), "Trigger a pre-registered Jenkins deployment rollback job.", "jenkins.deployment.rollback", ("deployment_completed", "service_health"), input_schema={"job": {"type": "string", "required": True}, "revision": {"type": "string", "required": True}}, dry_run_supported=True, reversible=True),
+            d("terraform.rollback", "terraform", "critical", ("infrastructure", "cloud_resource"), "Apply a governed infrastructure rollback plan from an approved state transition.", "terraform.rollback", ("plan_matches_expected_state", "resource_health"), input_schema={"approved_plan_ref": {"type": "string", "required": True}}, dry_run_supported=True, reversible=True, trust_level=CapabilityTrust.HITL_ONLY, required_approval=True),
         )
         for definition in defaults:
             self.register(definition)

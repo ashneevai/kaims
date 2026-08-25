@@ -2,19 +2,34 @@ from __future__ import annotations
 
 from api_gateway.modules.users.models import SystemRole
 
-ADMIN_ROLE = SystemRole.ADMINISTRATOR.value
-DOCUMENT_PROVIDER_ROLES = {
+ADMIN_ROLES = {
+    SystemRole.ADMIN.value,
     SystemRole.ADMINISTRATOR.value,
-    SystemRole.L2_ENGINEER.value,
-    SystemRole.L3_ENGINEER.value,
 }
+
+HITL_APPROVER_ROLES = {
+    SystemRole.ADMIN.value,
+    SystemRole.HITL_APPROVER.value,
+    # Temporary migration aliases. Remove after legacy users are migrated.
+    SystemRole.ADMINISTRATOR.value,
+    SystemRole.L3_ENGINEER.value,
+    SystemRole.L2_ENGINEER.value,
+}
+
+DOCUMENT_PROVIDER_ROLES = {
+    *ADMIN_ROLES,
+    SystemRole.HITL_APPROVER.value,
+    SystemRole.L3_ENGINEER.value,
+    SystemRole.L2_ENGINEER.value,
+}
+
 AUTHENTICATED_WRITE_RULES: tuple[tuple[set[str] | None, str, set[str] | None], ...] = (
-    (None, "/applications", {ADMIN_ROLE}),
-    (None, "/onboarding", {ADMIN_ROLE}),
-    (None, "/monitoring", {ADMIN_ROLE}),
+    (None, "/applications", ADMIN_ROLES),
+    (None, "/onboarding", ADMIN_ROLES),
+    (None, "/monitoring", ADMIN_ROLES),
     ({"POST", "PUT", "DELETE", "PATCH"}, "/rag", DOCUMENT_PROVIDER_ROLES),
-    ({"POST", "PUT", "DELETE", "PATCH"}, "/model", {ADMIN_ROLE}),
-    ({"POST", "PUT", "DELETE", "PATCH"}, "/approval", None),
+    ({"POST", "PUT", "DELETE", "PATCH"}, "/model", ADMIN_ROLES),
+    ({"POST", "PUT", "DELETE", "PATCH"}, "/approval", HITL_APPROVER_ROLES),
 )
 
 

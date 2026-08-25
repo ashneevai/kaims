@@ -1,0 +1,231 @@
+:root {
+  --kai-midnight: #07111f;
+  --kai-graphite: #101926;
+  --kai-surface: #1c2838;
+  --kai-intelligence: #4f7cff;
+  --kai-electric: #6c8eff;
+  --kai-signal: #21d4d4;
+  --kai-ai: #8b7cff;
+  --kai-text-primary: #f7f9fc;
+  --kai-text-secondary: #aab7c7;
+  --kai-healthy: #34c38f;
+  --kai-degraded: #f2b84b;
+  --kai-critical: #ff5f68;
+  --kai-focus-ring: 0 0 0 3px rgba(79, 124, 255, 0.28);
+}
+
+.kai-experience-shell {
+  min-height: 100vh;
+}
+
+.kai-view-switcher {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  z-index: 5000;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(540px, calc(100vw - 32px));
+  padding: 8px 10px 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--kai-intelligence) 26%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--kai-midnight) 94%, transparent);
+  color: var(--kai-text-primary);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(14px);
+}
+
+.kai-view-switcher__label {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.kai-view-switcher__eyebrow {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--kai-signal);
+}
+
+.kai-view-switcher__hint {
+  max-width: 265px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--kai-text-secondary);
+}
+
+.kai-view-switcher__controls {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 3px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.kai-view-switcher button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--kai-text-secondary);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, transform 140ms ease;
+}
+
+.kai-view-switcher button:hover {
+  color: var(--kai-text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.kai-view-switcher button:focus-visible {
+  outline: none;
+  box-shadow: var(--kai-focus-ring);
+}
+
+.kai-view-switcher button.is-active {
+  color: white;
+  background: linear-gradient(135deg, var(--kai-intelligence), var(--kai-ai));
+}
+
+.kai-view-switcher button svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+}
+
+html[data-kai-view="simple"] [data-kai-detail-density="technical"] {
+  max-height: 110px;
+  overflow: hidden;
+  position: relative;
+  opacity: 0.82;
+  mask-image: linear-gradient(to bottom, #000 55%, transparent 100%);
+}
+
+html[data-kai-view="simple"] [data-kai-detail-density="dense-table"] {
+  display: block;
+  max-height: 360px;
+  overflow: auto;
+  border-radius: 12px;
+}
+
+html[data-kai-view="simple"] [data-kai-long-copy="true"] {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+html[data-kai-view="simple"] [class*="raw" i] details,
+html[data-kai-view="simple"] [class*="debug" i] details,
+html[data-kai-view="simple"] [class*="trace" i] details {
+  display: none;
+}
+
+/* Reusable visual language for progressively migrated KaiMS screens. */
+.kai-visual-card {
+  border: 1px solid color-mix(in srgb, var(--kai-intelligence) 18%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--kai-graphite) 92%, transparent);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.14);
+}
+
+.kai-visual-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 14px;
+}
+
+.kai-status-ring {
+  --value: 0;
+  --ring-color: var(--kai-intelligence);
+  width: 84px;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: conic-gradient(var(--ring-color) calc(var(--value) * 1%), rgba(255, 255, 255, 0.08) 0);
+  position: relative;
+}
+
+.kai-status-ring::after {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border-radius: inherit;
+  background: var(--kai-graphite);
+}
+
+.kai-status-ring > * {
+  position: relative;
+  z-index: 1;
+}
+
+.kai-flow-rail {
+  display: grid;
+  grid-template-columns: repeat(var(--kai-flow-count, 4), minmax(90px, 1fr));
+  gap: 8px;
+  align-items: center;
+}
+
+.kai-flow-step {
+  position: relative;
+  min-height: 58px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.kai-flow-step:not(:last-child)::after {
+  content: "→";
+  position: absolute;
+  right: -10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--kai-text-secondary);
+  z-index: 2;
+}
+
+@media (max-width: 900px) {
+  .kai-view-switcher__label {
+    display: none;
+  }
+
+  .kai-flow-rail {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .kai-flow-step:not(:last-child)::after {
+    display: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .kai-view-switcher {
+    top: auto;
+    bottom: 12px;
+    right: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kai-view-switcher button {
+    transition: none;
+  }
+}

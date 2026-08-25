@@ -8,7 +8,7 @@ from common.resolution_models import PlanSnapshot, RemediationPlan
 
 
 class CapabilityContractGate:
-    """Separates AI recommendation text from the governed execution contract.
+    """Separate AI recommendation text from the governed execution contract.
 
     Legacy commands remain available only as an operator-facing preview. They never
     grant execution authority. A recommendation is execution-eligible only when it
@@ -21,7 +21,11 @@ class CapabilityContractGate:
     @staticmethod
     def _exact_capability_intent(recommendation: Recommendation) -> str | None:
         metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
-        remediation = metadata.get("remediation_analysis") if isinstance(metadata.get("remediation_analysis"), dict) else {}
+        remediation = (
+            metadata.get("remediation_analysis")
+            if isinstance(metadata.get("remediation_analysis"), dict)
+            else {}
+        )
         candidates: list[Any] = [
             metadata.get("recommended_capability"),
             remediation.get("recommended_capability"),
@@ -33,6 +37,20 @@ class CapabilityContractGate:
                 return token
         return None
 
+    @staticmethod
+    def _force_quality_gate_review(metadata: dict[str, Any]) -> None:
+        quality_gate = (
+            metadata.get("quality_gate")
+            if isinstance(metadata.get("quality_gate"), dict)
+            else {}
+        )
+        quality_gate["trusted_for_auto_execution"] = False
+        quality_gate["requires_human_review"] = True
+        quality_gate["execution_contract_reason"] = (
+            "structured remediation plan is required before execution"
+        )
+        metadata["quality_gate"] = quality_gate
+
     def apply(self, recommendation: Recommendation) -> Recommendation:
         metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
         metadata["execution_contract"] = "structured-remediation-plan-v1"
@@ -43,6 +61,7 @@ class CapabilityContractGate:
         }
         metadata["execution_allowed"] = False
         metadata["planning_status"] = "CAPABILITY_SELECTION_REQUIRED"
+        self._force_quality_gate_review(metadata)
 
         plan_payload = metadata.get("remediation_plan")
         if isinstance(plan_payload, dict):
@@ -57,15 +76,23 @@ class CapabilityContractGate:
                 return recommendation.model_copy(update={"metadata": metadata})
 
             snapshot = PlanSnapshot.from_plan(plan)
+            execution_allowed = bool(
+                plan.preflight_assessment
+                and plan.preflight_assessment.passed
+                and plan.risk_assessment is not None
+            )
             metadata["remediation_plan"] = plan.model_dump(mode="json")
             metadata["plan_hash"] = snapshot.plan_hash
             metadata["plan_revision"] = snapshot.plan_revision
             metadata["recommended_capability"] = plan.recommended_capability
             metadata["planning_status"] = "STRUCTURED_PLAN_READY"
-            metadata["execution_allowed"] = bool(
-                plan.preflight_assessment
-                and plan.preflight_assessment.passed
-                and plan.risk_assessment is not None
+            metadata["execution_allowed"] = execution_allowed
+            quality_gate = metadata["quality_gate"]
+            quality_gate["requires_human_review"] = not execution_allowed
+            quality_gate["execution_contract_reason"] = (
+                "structured plan passed Wave 3 contract checks"
+                if execution_allowed
+                else "structured plan is not execution eligible"
             )
             return recommendation.model_copy(update={"metadata": metadata})
 

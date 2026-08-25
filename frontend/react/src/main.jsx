@@ -7,6 +7,7 @@ import "./datamatics-base.css";
 import "./datamatics-light.css";
 import "./datamatics-dark.css";
 import "./experience/experience.css";
+import "./experience/visual-primitives.css";
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>

@@ -11,6 +11,7 @@ from common.execution_safety import (
 from common.models import Approval, RemediationAction, RemediationStatus
 from common.rollback_governance import apply_rollback_governance
 from remediation_engine.execution_coordinator import build_execution_coordinator
+from remediation_engine.kubernetes_staged import KubernetesNativeStagedPlugin
 from remediation_engine.safe_engine import SafeRemediationEngine
 from remediation_engine.staged_executor import NativeStagedExecutor
 
@@ -23,12 +24,17 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         *args: Any,
         execution_coordinator: Any | None = None,
         staged_executor: NativeStagedExecutor | None = None,
+        staged_plugins: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._settings = get_settings()
         self.execution_coordinator = execution_coordinator or build_execution_coordinator(self._settings)
         self.staged_executor = staged_executor or NativeStagedExecutor()
+        self.staged_plugins = staged_plugins or {
+            "restart_pod": KubernetesNativeStagedPlugin(action_type="restart_pod"),
+            "scale_deployment": KubernetesNativeStagedPlugin(action_type="scale_deployment"),
+        }
 
     def build_action(self, approval: Approval) -> RemediationAction:
         action = super().build_action(approval)
@@ -53,7 +59,10 @@ class GovernedRemediationEngine(SafeRemediationEngine):
         if not multi_stage:
             return await super().execute(action)
 
-        plugin = self.plugins.get(str(action.action_type or "").strip().lower())
+        action_type = str(action.action_type or "").strip().lower()
+        plugin = self.staged_plugins.get(action_type)
+        if plugin is None:
+            plugin = self.plugins.get(action_type)
         if plugin is None:
             return self._block_execution(
                 action,

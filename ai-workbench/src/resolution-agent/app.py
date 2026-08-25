@@ -5,10 +5,10 @@ import os
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
+from ai_workbench_common.models import Context
 from common.config import get_settings
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
-from ai_workbench_common.models import Context
 from common.models import Incident, Recommendation
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
@@ -243,7 +243,6 @@ async def startup(app: FastAPI) -> None:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)
                 await repo.save_recommendation_as_audit(recommendation)
-                await _persist_structured_plan(session=session, context=context, recommendation=recommendation)
                 await session.commit()
         await _persist_resolution_event(
             app=app,

@@ -50,19 +50,23 @@ def test_policy_engine_requires_approval_for_high_and_critical() -> None:
     assert engine.requires_approval(severity=AlertSeverity.WARNING, confidence=0.95) is False
 
 
-def test_policy_engine_evaluates_hybrid_execution_bands() -> None:
+def test_policy_engine_fails_closed_until_structured_policy_migration() -> None:
     engine = PolicyEngine()
 
     low_confidence = engine.evaluate(severity=AlertSeverity.WARNING, confidence=0.70)
     guided_confidence = engine.evaluate(severity=AlertSeverity.WARNING, confidence=0.80)
+    missing_confidence = engine.evaluate(severity=AlertSeverity.WARNING, confidence=None)
     high_confidence = engine.evaluate(severity=AlertSeverity.WARNING, confidence=0.96)
 
     assert low_confidence.requires_approval is True
     assert low_confidence.execution_mode == "human-approval"
     assert low_confidence.risk_tier == "medium"
 
-    assert guided_confidence.requires_approval is False
-    assert guided_confidence.execution_mode == "guided-auto"
+    assert guided_confidence.requires_approval is True
+    assert guided_confidence.execution_mode == "human-approval"
+
+    assert missing_confidence.requires_approval is True
+    assert missing_confidence.execution_mode == "human-approval"
 
     assert high_confidence.requires_approval is False
     assert high_confidence.execution_mode == "auto-execute"

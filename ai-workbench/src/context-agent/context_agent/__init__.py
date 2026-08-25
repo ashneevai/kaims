@@ -1,3 +1,5 @@
-from context_agent.connectors import ContextIntelligenceAgent
+from context_agent.safe_context import ProductionContextIntelligenceAgent
 
-__all__ = ["ContextIntelligenceAgent"]
+ContextIntelligenceAgent = ProductionContextIntelligenceAgent
+
+__all__ = ["ContextIntelligenceAgent", "ProductionContextIntelligenceAgent"]

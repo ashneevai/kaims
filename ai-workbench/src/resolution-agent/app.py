@@ -5,16 +5,22 @@ import os
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
+from ai_workbench_common.models import Context
 from common.config import get_settings
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
-from ai_workbench_common.models import Context
 from common.models import Incident, Recommendation
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
+from common.resolution_guard import (
+    build_resolution_guard_hitl_payload,
+    evaluate_reassessment_recommendation,
+)
+from common.resolution_models import PlanSnapshot, RemediationPlan
+from common.resolution_store import CanonicalResolutionStore
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
-from common.topics import CONTEXT_EVENTS, RESOLUTION_EVENTS
+from common.topics import CONTEXT_EVENTS, HITL_REVIEW_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI
 from resolution_agent import ResolutionIntelligenceAgent
 
@@ -27,6 +33,23 @@ MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
+
+
+def _context_scope(context: Context) -> tuple[str | None, str | None]:
+    context_metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    alert_metadata = context.alert.metadata if isinstance(context.alert.metadata, dict) else {}
+    tenant_id = str(
+        context_metadata.get("tenant_id")
+        or alert_metadata.get("tenant_id")
+        or ""
+    ).strip() or None
+    environment = str(
+        context.alert.environment
+        or context_metadata.get("environment")
+        or alert_metadata.get("environment")
+        or ""
+    ).strip() or None
+    return tenant_id, environment
 
 
 def _build_resolution_event_payload(
@@ -45,6 +68,10 @@ def _build_resolution_event_payload(
         agent="resolution-agent",
         payload={
             "recommended_action": recommendation.recommended_action,
+            "recommended_capability": recommendation.metadata.get("recommended_capability"),
+            "plan_hash": recommendation.metadata.get("plan_hash"),
+            "plan_revision": recommendation.metadata.get("plan_revision"),
+            "planning_status": recommendation.metadata.get("planning_status"),
             "risk": recommendation.risk,
             "topic": RESOLUTION_EVENTS,
         },
@@ -65,6 +92,24 @@ def _build_resolution_event_payload(
         "decision": decision_payload,
         "event_contract": event_contract,
     }
+
+
+async def _persist_structured_plan(*, session: Any, context: Context, recommendation: Recommendation) -> None:
+    metadata = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
+    plan_payload = metadata.get("remediation_plan")
+    if not isinstance(plan_payload, dict):
+        return
+    tenant_id, _ = _context_scope(context)
+    if not tenant_id:
+        raise ValueError("TENANT_CONTEXT_MISSING: cannot persist remediation plan without tenant scope")
+    plan = RemediationPlan.model_validate(plan_payload)
+    snapshot = PlanSnapshot.from_plan(plan)
+    approved_hash = str(metadata.get("plan_hash") or "").strip()
+    approved_revision = metadata.get("plan_revision")
+    if approved_hash != snapshot.plan_hash or int(approved_revision or 0) != snapshot.plan_revision:
+        raise ValueError("PLAN_SNAPSHOT_MISMATCH")
+    store = CanonicalResolutionStore(session)
+    await store.save_plan(tenant_id=tenant_id, plan=plan, snapshot=snapshot)
 
 
 async def _persist_resolution_event(
@@ -92,6 +137,11 @@ async def _persist_resolution_event(
         or orchestration.get("message_bus_provider")
         or "unknown"
     )
+    tenant_id, environment = _context_scope(context)
+    if not tenant_id:
+        raise ValueError("TENANT_CONTEXT_MISSING: resolution event persistence requires tenant scope")
+    if not environment:
+        raise ValueError("ENVIRONMENT_CONTEXT_MISSING: resolution event persistence requires environment")
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
         await repo.save_incident_event(
@@ -106,9 +156,9 @@ async def _persist_resolution_event(
                     "parent_event_id": None,
                 },
                 scope={
-                    "tenant_id": "default",
+                    "tenant_id": tenant_id,
                     "service": str(context.alert.service or "unknown"),
-                    "environment": str(context.alert.environment or "prod"),
+                    "environment": environment,
                     "region": None,
                     "team": str(context.alert.metadata.get("owner_team") or "") or None,
                 },
@@ -140,12 +190,17 @@ async def _persist_resolution_event(
                 payload={
                     "recommendation_id": str(recommendation.id),
                     "recommended_action": recommendation.recommended_action,
+                    "recommended_capability": metadata.get("recommended_capability"),
+                    "plan_hash": metadata.get("plan_hash"),
+                    "plan_revision": metadata.get("plan_revision"),
+                    "planning_status": metadata.get("planning_status"),
                     "root_cause": recommendation.root_cause,
                     "impact": recommendation.impact,
                     "risk": recommendation.risk,
                 },
             )
         )
+        await _persist_structured_plan(session=session, context=context, recommendation=recommendation)
         await session.commit()
 
 
@@ -188,6 +243,41 @@ async def startup(app: FastAPI) -> None:
                 "stream_count": decision_payload.get("stream_count"),
                 "stream_threshold": decision_payload.get("stream_threshold"),
             }
+
+        guard = evaluate_reassessment_recommendation(
+            recommended_action=recommendation.recommended_action,
+            recommended_capability=recommendation.metadata.get("recommended_capability"),
+            decision_payload=decision_payload,
+        )
+        recommendation.metadata["reassessment_guard"] = {
+            "allowed": guard.allowed,
+            "reason": guard.reason,
+            "requires_hitl": guard.requires_hitl,
+        }
+        if not guard.allowed:
+            if settings.database_enabled:
+                async with app.state.session_factory() as session:
+                    repo = IncidentRepository(session)
+                    await repo.save_recommendation_as_audit(recommendation)
+                    await session.commit()
+            hitl_payload = build_resolution_guard_hitl_payload(
+                incident_id=str(incident.id),
+                recommendation=recommendation,
+                decision_payload=decision_payload,
+                reason=guard.reason,
+            )
+            await app.state.producer.publish(
+                HITL_REVIEW_EVENTS,
+                hitl_payload,
+                key=str(incident.id),
+            )
+            EVENTS_PROCESSED.labels(
+                settings.service_name,
+                HITL_REVIEW_EVENTS,
+                "blocked_reassessment",
+            ).inc()
+            return
+
         if settings.database_enabled:
             async with app.state.session_factory() as session:
                 repo = IncidentRepository(session)

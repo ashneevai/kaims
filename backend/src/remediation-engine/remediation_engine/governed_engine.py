@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+from typing import Any
+
+from common.autonomy_control import AutonomyMode, action_allowed_for_mode
+from common.autonomy_runtime import AutonomyRuntimeStore
+from common.config import get_settings
+from common.enterprise_governance import enforce_tenant_scope, validate_secret_governance
+from common.execution_safety import (
+    ExecutionSafetyDecision,
+    build_execution_safety_assessment,
+    immutable_pre_execution_snapshot,
+)
+from common.models import Approval, RemediationAction, RemediationStatus
+from common.rollback_governance import apply_rollback_governance
+from remediation_engine.execution_coordinator import build_execution_coordinator
+from remediation_engine.jenkins_staged import JenkinsNativeStagedPlugin
+from remediation_engine.kubernetes_staged import KubernetesNativeStagedPlugin
+from remediation_engine.safe_engine import SafeRemediationEngine
+from remediation_engine.staged_executor import NativeStagedExecutor
+from remediation_engine.terraform_staged import TerraformNativeStagedPlugin
+
+
+class GovernedRemediationEngine(SafeRemediationEngine):
+    """Safe remediation engine with enterprise, autonomy, and execution-safety enforcement."""
+
+    def __init__(
+        self,
+        *args: Any,
+        execution_coordinator: Any | None = None,
+        staged_executor: NativeStagedExecutor | None = None,
+        staged_plugins: dict[str, Any] | None = None,
+        autonomy_store: AutonomyRuntimeStore | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._settings = get_settings()
+        self.execution_coordinator = execution_coordinator or build_execution_coordinator(self._settings)
+        self.autonomy_store = autonomy_store or AutonomyRuntimeStore(
+            self._settings.redis_url,
+            environment=self._settings.environment,
+        )
+        self.staged_executor = staged_executor or NativeStagedExecutor()
+        self.staged_plugins = staged_plugins or {
+            "restart_pod": KubernetesNativeStagedPlugin(action_type="restart_pod"),
+            "scale_deployment": KubernetesNativeStagedPlugin(action_type="scale_deployment"),
+            "rollback_deployment": JenkinsNativeStagedPlugin(action_type="rollback_deployment"),
+            "terraform_rollback": TerraformNativeStagedPlugin(action_type="terraform_rollback"),
+        }
+
+    @property
+    def _production(self) -> bool:
+        return self._settings.environment.lower() not in {
+            "local", "dev", "development", "test", "testing", "simulation"
+        }
+
+    def build_action(self, approval: Approval) -> RemediationAction:
+        action = super().build_action(approval)
+        if action.action_type == "unsupported_capability":
+            return action
+        return apply_rollback_governance(approval=approval, action=action)
+
+    @staticmethod
+    def _block_execution(action: RemediationAction, reason: str) -> RemediationAction:
+        action.status = RemediationStatus.SKIPPED
+        action.error = reason
+        action.output = "remediation blocked by execution safety controller"
+        action.parameters["execution_safety_block_reason"] = reason
+        return action
+
+    def _apply_enterprise_governance(self, action: RemediationAction) -> RemediationAction | None:
+        expected_tenant = action.parameters.get("authorized_tenant_id")
+        actual_tenant = action.parameters.get("tenant_id")
+        tenant = enforce_tenant_scope(
+            expected_tenant_id=expected_tenant,
+            payload_tenant_id=actual_tenant,
+            production=self._production,
+        )
+        if not tenant.allowed:
+            return self._block_execution(action, tenant.reason)
+
+        connection_profile = action.parameters.get("connection_profile")
+        connection_profile = connection_profile if isinstance(connection_profile, dict) else {}
+        secret_ref = action.parameters.get("secret_ref") or connection_profile.get("secret_ref")
+        secret = validate_secret_governance(
+            secret_ref=secret_ref,
+            payload={"connection_profile": connection_profile},
+            production=self._production,
+        )
+        if not secret.allowed:
+            return self._block_execution(action, secret.reason)
+
+        action.parameters["enterprise_governance"] = {
+            "tenant_id": tenant.tenant_id,
+            "tenant_scope_verified": True,
+            "secret_ref": secret.secret_ref,
+            "secret_material_externalized": True,
+        }
+        return None
+
+    async def _apply_autonomy_governance(self, action: RemediationAction) -> RemediationAction | None:
+        governance = action.parameters.get("enterprise_governance")
+        governance = governance if isinstance(governance, dict) else {}
+        tenant_id = str(governance.get("tenant_id") or action.parameters.get("tenant_id") or "default")
+        state = await self.autonomy_store.get(tenant_id)
+        mode = str(state.get("mode") or AutonomyMode.HITL_ONLY.value).upper()
+        requires_approval = bool(action.approval_id) or bool(action.parameters.get("requires_approval"))
+        action.parameters["autonomy_governance"] = {
+            "tenant_id": tenant_id,
+            "mode": mode,
+            "score": state.get("score"),
+            "evaluated_at": state.get("evaluated_at"),
+            "reasons": state.get("reasons", []),
+        }
+        if mode == AutonomyMode.KILL_SWITCH.value:
+            return self._block_execution(action, "AUTONOMY_KILL_SWITCH_ACTIVE")
+        if not action_allowed_for_mode(mode=mode, requires_approval=requires_approval, is_read_only=False):
+            return self._block_execution(action, f"AUTONOMY_MODE_REQUIRES_APPROVAL:{mode}")
+        return None
+
+    async def _execute_with_strategy(self, action: RemediationAction) -> RemediationAction:
+        stages = action.parameters.get("execution_stages")
+        stages = [item for item in stages if isinstance(item, dict)] if isinstance(stages, list) else []
+        strategy = str(action.parameters.get("execution_strategy") or "SINGLE").strip().upper()
+        multi_stage = strategy in {"CANARY", "PROGRESSIVE"} or len(stages) > 1
+        if not multi_stage:
+            return await super().execute(action)
+        action_type = str(action.action_type or "").strip().lower()
+        plugin = self.staged_plugins.get(action_type) or self.plugins.get(action_type)
+        if plugin is None:
+            return self._block_execution(action, f"NATIVE_STAGED_EXECUTOR_UNAVAILABLE: no plugin registered for {action.action_type}")
+        result = await self.staged_executor.execute(plugin=plugin, action=action)
+        return result.action
+
+    async def execute(self, action: RemediationAction) -> RemediationAction:
+        governance_block = self._apply_enterprise_governance(action)
+        if governance_block is not None:
+            return governance_block
+        autonomy_block = await self._apply_autonomy_governance(action)
+        if autonomy_block is not None:
+            return autonomy_block
+
+        assessment = build_execution_safety_assessment(action)
+        action.parameters["pre_execution_snapshot"] = immutable_pre_execution_snapshot(action)
+        action.parameters["pre_execution_snapshot_hash"] = assessment.snapshot_hash
+        action.parameters["execution_idempotency_key"] = assessment.idempotency_key
+        action.parameters["execution_lock_key"] = assessment.lock_key
+        action.parameters["execution_stages"] = [
+            {"name": stage.name, "percent": stage.percent, "requires_health_gate": stage.requires_health_gate}
+            for stage in assessment.stages
+        ]
+        action.parameters.setdefault("execution_abort_policy", {
+            "abort_on_health_gate_failure": True,
+            "abort_on_new_critical_alert": True,
+            "abort_on_error_rate_regression": True,
+            "abort_on_dependency_regression": True,
+            "require_manual_recovery_after_rollback_failure": True,
+        })
+        if assessment.decision == ExecutionSafetyDecision.BLOCK:
+            return self._block_execution(action, assessment.reason)
+
+        coordination = await self.execution_coordinator.acquire(
+            lock_key=assessment.lock_key,
+            idempotency_key=assessment.idempotency_key,
+            ttl_seconds=int(action.parameters.get("execution_lock_ttl_seconds") or 600),
+        )
+        if not coordination.acquired:
+            reason = "IDEMPOTENT_DUPLICATE: execution already completed" if coordination.duplicate else f"EXECUTION_LOCK_UNAVAILABLE: {coordination.reason}"
+            return self._block_execution(action, reason)
+
+        success = False
+        try:
+            action.parameters["execution_coordination"] = {
+                "lock_acquired": True,
+                "distributed": self._production,
+                "reason": coordination.reason,
+            }
+            action = await self._execute_with_strategy(action)
+            success = action.status == RemediationStatus.SUCCEEDED
+            return action
+        finally:
+            await self.execution_coordinator.complete(
+                lock_key=assessment.lock_key,
+                idempotency_key=assessment.idempotency_key,
+                success=success,
+            )

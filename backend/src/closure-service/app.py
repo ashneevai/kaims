@@ -2,24 +2,29 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from closure_service import ClosureValidationAgent
+from closure_service.providers import PrometheusValidationEvidenceProvider
 from common.config import get_settings
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
 from common.models import Incident, IncidentStatus, RemediationAction, ResolutionReport
 from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
+from common.resolution_models import ValidationOutcome
+from common.resolution_store import CanonicalResolutionStore
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
 from common.topics import CLOSURE_EVENTS, REMEDIATION_EVENTS
+from common.validation_models import ValidationAssessment
 from fastapi import FastAPI
 
 settings = get_settings()
 settings.service_name = "closure-service"
-agent = ClosureValidationAgent()
+validation_provider = PrometheusValidationEvidenceProvider(settings.prometheus_url) if settings.prometheus_url else None
+agent = ClosureValidationAgent(provider=validation_provider)
 tasks: list[asyncio.Task] = []
 
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
@@ -30,6 +35,15 @@ def _extract_remediation_action_payload(payload: dict[str, Any]) -> dict[str, An
     if isinstance(action, dict):
         return action
     return payload
+
+
+def _validation_outcome(report: ResolutionReport) -> ValidationOutcome:
+    metadata = report.metadata if isinstance(report.metadata, dict) else {}
+    raw = str(metadata.get("validation_outcome") or metadata.get("validation_status") or "").upper()
+    try:
+        return ValidationOutcome(raw)
+    except ValueError:
+        return ValidationOutcome.INCONCLUSIVE
 
 
 def _build_closure_event_payload(
@@ -43,6 +57,7 @@ def _build_closure_event_payload(
     flow_id = str(source_contract.get("flow_id") or incident_id)
     trace_id = str(source_contract.get("trace_id") or "")
     correlation_id = str(source_contract.get("correlation_id") or "") or None
+    outcome = _validation_outcome(report)
 
     event_contract = build_agent_event_contract(
         flow_id=flow_id,
@@ -54,16 +69,18 @@ def _build_closure_event_payload(
             "action_taken": report.action_taken,
             "health_restored": report.health_restored,
             "alerts_cleared": report.alerts_cleared,
+            "validation_outcome": outcome.value,
+            "next_action": report.metadata.get("validation_next_action"),
             "topic": CLOSURE_EVENTS,
         },
         metadata={
             "root_cause": report.root_cause,
             "impact": report.impact,
         },
-        confidence=1.0 if report.health_restored else 0.7,
-        reasoning="closure validation derived from remediation outcome and health checks",
+        confidence=1.0 if outcome == ValidationOutcome.RECOVERED else 0.0,
+        reasoning="closure validation derived from independent multi-window post-action evidence",
         citations=[f"report://{report.id}"],
-        evidence_ids=[f"action:{action.id}", f"incident:{incident_id}"],
+        evidence_ids=list(report.metadata.get("validation_evidence_ids", [])),
     )
     return {
         "report": report,
@@ -80,6 +97,51 @@ def _resolve_closure_service_name(action: RemediationAction, incident_payload: d
     return str(action.target or "unknown").strip() or "unknown"
 
 
+def _resolve_required_scope(
+    action: RemediationAction,
+    incident_payload: dict[str, Any],
+    recommendation: dict[str, Any],
+) -> tuple[str, str]:
+    action_metadata = action.metadata if isinstance(action.metadata, dict) else {}
+    tenant_id = str(
+        incident_payload.get("tenant_id")
+        or action.parameters.get("tenant_id")
+        or action_metadata.get("tenant_id")
+        or recommendation.get("tenant_id")
+        or ""
+    ).strip()
+    environment = str(
+        incident_payload.get("environment")
+        or action.parameters.get("environment")
+        or action_metadata.get("environment")
+        or recommendation.get("environment")
+        or ""
+    ).strip()
+
+    deployment_mode = str(getattr(settings, "environment", "local") or "local").strip().lower()
+    development_mode = deployment_mode in {"local", "dev", "development", "test", "testing", "simulation"}
+    if not tenant_id and development_mode:
+        tenant_id = "local"
+    if not environment and development_mode:
+        environment = deployment_mode or "local"
+
+    if not tenant_id:
+        raise ValueError("tenant scope is required for closure; refusing tenant 'default' fallback")
+    if not environment:
+        raise ValueError("environment scope is required for closure; refusing 'prod' fallback")
+    return tenant_id, environment
+
+
+def _incident_status_for_outcome(outcome: ValidationOutcome) -> IncidentStatus:
+    if outcome == ValidationOutcome.RECOVERED:
+        return IncidentStatus.CLOSED
+    if outcome in {ValidationOutcome.PARTIALLY_RECOVERED, ValidationOutcome.UNCHANGED}:
+        return IncidentStatus.INVESTIGATING
+    if outcome == ValidationOutcome.WORSE:
+        return IncidentStatus.REMEDIATING
+    return IncidentStatus.VALIDATING
+
+
 def _build_final_incident_payload(
     *,
     action: RemediationAction,
@@ -87,22 +149,25 @@ def _build_final_incident_payload(
     incident_payload: dict[str, Any] | None,
     recommendation: dict[str, Any] | None,
     source_contract: dict[str, Any] | None,
+    environment: str,
 ) -> dict[str, Any]:
     incident_payload_map = incident_payload if isinstance(incident_payload, dict) else {}
     recommendation_map = recommendation if isinstance(recommendation, dict) else {}
     source_contract_map = source_contract if isinstance(source_contract, dict) else {}
     service_name = _resolve_closure_service_name(action, incident_payload_map)
+    outcome = _validation_outcome(report)
+    incident_status = _incident_status_for_outcome(outcome)
     final_payload = {
         "id": str(action.incident_id),
         "service": service_name,
-        "environment": str(incident_payload_map.get("environment") or action.parameters.get("environment") or "prod"),
+        "environment": environment,
         "severity": str(incident_payload_map.get("severity") or recommendation_map.get("severity") or "warning").lower(),
-        "status": IncidentStatus.CLOSED.value if report.health_restored else IncidentStatus.FAILED.value,
+        "status": incident_status.value,
         "title": str(incident_payload_map.get("title") or f"Incident {action.incident_id}"),
         "summary": str(incident_payload_map.get("summary") or ""),
         "owner_team": incident_payload_map.get("owner_team"),
         "ticket_id": incident_payload_map.get("ticket_id"),
-        "closed_at": datetime.now(timezone.utc).isoformat() if report.health_restored else incident_payload_map.get("closed_at"),
+        "closed_at": datetime.now(UTC).isoformat() if outcome == ValidationOutcome.RECOVERED else None,
         "trace_id": str(
             incident_payload_map.get("trace_id")
             or source_contract_map.get("trace_id")
@@ -124,25 +189,36 @@ async def _persist_closure_event(
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
         return
     source_contract = source_payload.get("event_contract", {}) if isinstance(source_payload.get("event_contract"), dict) else {}
-    source_recommendation = source_payload.get("source_payload", {}).get("recommendation") if isinstance(source_payload.get("source_payload"), dict) else {}
+    source_payload_map = source_payload.get("source_payload", {}) if isinstance(source_payload.get("source_payload"), dict) else {}
+    source_recommendation = source_payload_map.get("recommendation")
     recommendation = source_recommendation if isinstance(source_recommendation, dict) else {}
-    status = "closed" if bool(report.health_restored) else "failed"
+    outcome = _validation_outcome(report)
 
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
         incident_payload = await repo.get_incident(str(action.incident_id)) or {}
+        tenant_id, environment = _resolve_required_scope(action, incident_payload, recommendation)
         final_incident_payload = _build_final_incident_payload(
             action=action,
             report=report,
             incident_payload=incident_payload,
             recommendation=recommendation,
             source_contract=source_contract,
+            environment=environment,
         )
         service_name = str(final_incident_payload.get("service") or "unknown")
         await repo.save_incident(Incident.model_validate(final_incident_payload))
+
+        assessment_payload = report.metadata.get("validation_assessment") if isinstance(report.metadata, dict) else None
+        if isinstance(assessment_payload, dict):
+            assessment = ValidationAssessment.model_validate(assessment_payload)
+            if not assessment.tenant_id:
+                assessment = assessment.model_copy(update={"tenant_id": tenant_id})
+            await CanonicalResolutionStore(session).save_validation_assessment(assessment)
+
         await repo.save_incident_event(
             build_event_envelope(
-                event_type="incident.closure.completed",
+                event_type="incident.validation.completed",
                 identity={
                     "incident_id": str(action.incident_id),
                     "alert_id": None,
@@ -152,15 +228,15 @@ async def _persist_closure_event(
                     "parent_event_id": None,
                 },
                 scope={
-                    "tenant_id": "default",
+                    "tenant_id": tenant_id,
                     "service": service_name,
-                    "environment": "prod",
+                    "environment": environment,
                     "region": None,
                     "team": None,
                 },
                 state={
                     "severity": str(recommendation.get("severity") or "warning").lower(),
-                    "status": status,
+                    "status": outcome.value.lower(),
                     "owner": None,
                 },
                 policy={
@@ -168,7 +244,7 @@ async def _persist_closure_event(
                     "execution_mode": "unknown",
                     "requires_approval": None,
                     "policy_version": None,
-                    "policy_reason": "closure validation completed",
+                    "policy_reason": "independent closed-loop validation completed",
                 },
                 transport={
                     "provider": "unknown",
@@ -183,6 +259,10 @@ async def _persist_closure_event(
                     "action_taken": report.action_taken,
                     "health_restored": report.health_restored,
                     "alerts_cleared": report.alerts_cleared,
+                    "validation_outcome": outcome.value,
+                    "next_action": report.metadata.get("validation_next_action"),
+                    "validation_windows_completed": report.metadata.get("validation_windows_completed"),
+                    "validation_evidence_count": report.metadata.get("validation_evidence_count"),
                 },
             )
         )
@@ -230,7 +310,15 @@ async def _validate_and_store(action: RemediationAction) -> ResolutionReport:
         async with app.state.session_factory() as session:
             repo = IncidentRepository(session)
             await repo.save_report(report)
-            await repo.save_knowledge_base(report)
+            independently_verified = bool(
+                report.health_restored
+                and report.validation.get("independent_validation") is True
+                and report.validation.get("required_consecutive_windows_met") is True
+                and int(report.metadata.get("validation_evidence_count") or 0) > 0
+                and _validation_outcome(report) == ValidationOutcome.RECOVERED
+            )
+            if independently_verified:
+                await repo.save_knowledge_base(report)
             await session.commit()
     return report
 

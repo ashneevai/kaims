@@ -141,11 +141,25 @@ def test_analyze_response_runs_local_rules_when_opted_in() -> None:
     assert result.provider == "local"
 
 
-def test_gateway_operational_auth_policy_marks_admin_routes() -> None:
-    assert route_auth_rule("POST", "/onboarding/complete") == {"Administrator"}
-    assert route_auth_rule("GET", "/monitoring/integrations") == {"Administrator"}
-    assert route_auth_rule("POST", "/rag/documents") == {"Administrator", "L2 Engineer", "L3 Engineer"}
-    assert route_auth_rule("POST", "/approval/approve") is None
+def test_gateway_operational_auth_policy_uses_core_roles_with_legacy_aliases() -> None:
+    assert route_auth_rule("POST", "/onboarding/complete") == {"ADMIN", "Administrator"}
+    assert route_auth_rule("GET", "/monitoring/integrations") == {"ADMIN", "Administrator"}
+    assert route_auth_rule("POST", "/rag/documents") == {
+        "ADMIN",
+        "HITL_APPROVER",
+        "Administrator",
+        "L2 Engineer",
+        "L3 Engineer",
+    }
+    assert route_auth_rule("POST", "/approval/approve") == {
+        "ADMIN",
+        "HITL_APPROVER",
+        "Administrator",
+        "L2 Engineer",
+        "L3 Engineer",
+    }
+    assert "L1 Operator" not in route_auth_rule("POST", "/approval/approve")
+    assert "Executive" not in route_auth_rule("POST", "/approval/approve")
     assert route_auth_rule("POST", "/api/v1/alerts/prometheus") is False
 
 
